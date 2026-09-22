@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+*.tgz
+
+# The server's own data, never versioned: PLINTH_DATA_DIR pointed inside the
+# repository, or the default ~/.plinth if a home directory is checked out here.
+.data*/
+.plinth/
