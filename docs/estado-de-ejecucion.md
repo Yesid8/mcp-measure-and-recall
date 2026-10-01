@@ -17,7 +17,7 @@
 | **A5** — Rodaje con un consumidor real | **aplazada** (la hará el primer consumidor, desde su proyecto) | Ver §4 |
 | **A6** — Documento de traspaso | **completa** | [USO.md](USO.md) |
 
-**470 tests en verde**, unitarios y de contrato. Al cierre de A4 eran 160; el resto los
+**472 tests en verde**, unitarios y de contrato. Al cierre de A4 eran 160; el resto los
 añadieron las revisiones de código posteriores, que cubrieron rutas de error, bordes de
 protocolo y fallos propios de Windows. `typecheck`, `lint`, `format:check` y `test` limpios,
 sin errores sueltos en ejecuciones repetidas, y la CI los repite en Linux y Windows.

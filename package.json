@@ -1,6 +1,6 @@
 {
   "name": "@plinth/facts",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "An MCP server that only holds facts: measure and recall, never judge.",
   "license": "0BSD",
   "repository": {

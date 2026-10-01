@@ -197,6 +197,63 @@ describe('§8.5 cacheable results carry caching hints (SEP-2549)', () => {
   })
 })
 
+describe('a published inputSchema describes what a caller may send', () => {
+  const received: unknown[] = []
+  const plan = defineTool({
+    name: 'plan',
+    title: 'Plan',
+    description: 'Echoes the arguments as parsed. Test scaffolding.',
+    input: z
+      .object({
+        project: z.string().describe('project'),
+        name: z.string().describe('Required: no default.'),
+        modules: z.array(z.string()).default([]).describe('Defaulted at the top level.'),
+        items: z
+          .array(
+            z.object({
+              title: z.string().describe('Required inside each item.'),
+              priority: z.number().default(3).describe('Defaulted inside each item.'),
+            }),
+          )
+          .describe('Defaults nested in an array of objects.'),
+      })
+      .strict(),
+    output: z.object({ ok: z.boolean().describe('always true') }).strict(),
+    target: (i) => ({ project: i.project }),
+    handler: async (i) => (received.push(i), Ok({ ok: true })),
+  })
+
+  it('lists a field with a default as optional, at any depth', async () => {
+    client = inProcessClient({ tools: [plan] })
+    const tools = resultOf(await client.request('tools/list'))['tools'] as {
+      inputSchema: {
+        required: string[]
+        properties: { items: { items: { required: string[] } } }
+      }
+    }[]
+    const schema = tools[0]!.inputSchema
+    expect(schema.required.sort()).toEqual(['items', 'name', 'project'])
+    expect(schema.properties.items.items.required).toEqual(['title'])
+  })
+
+  it('accepts a call without them and hands the tool the defaults', async () => {
+    client = inProcessClient({ tools: [plan] })
+    const out = readToolResult(
+      await client.request('tools/call', {
+        name: 'facts.plan',
+        arguments: { project: 'p', name: 'n', items: [{ title: 't' }] },
+      }),
+    )
+    expect(out.isError, JSON.stringify(out.envelope['error'])).toBe(false)
+    expect(received.at(-1)).toEqual({
+      project: 'p',
+      name: 'n',
+      modules: [],
+      items: [{ title: 't', priority: 3 }],
+    })
+  })
+})
+
 describe('§8.10 cancellation aborts the in-flight call', () => {
   it('stops the tool within 100 ms and sends nothing more for that request', async () => {
     let cancelledAt = 0

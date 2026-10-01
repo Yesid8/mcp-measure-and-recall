@@ -6,7 +6,7 @@
 > costó una etapa entera de trabajo bien hecho contra el artefacto equivocado; ver
 > [ADR-0002](adr/0002-el-sdk-v2-se-publico-con-otro-nombre.md).
 
-Estado actual: **etapas A1–A4 completas y B0 saldada**, 470 tests en verde.
+Estado actual: **etapas A1–A4 completas y B0 saldada**, 472 tests en verde.
 Detalle en [estado-de-ejecucion.md](estado-de-ejecucion.md). Lo siguiente es **A5**.
 
 ---
@@ -38,7 +38,7 @@ que es exactamente lo que hará quien use esto dentro de seis meses.
 
 ```
 Estás en la raíz de este repositorio. Lee docs/README.md y docs/estado-de-ejecucion.md para
-situarte: las etapas A1-A4 están completas y 470 tests están en verde. Esta es A5.
+situarte: las etapas A1-A4 están completas y 472 tests están en verde. Esta es A5.
 
 Conecta el servidor MCP:
 

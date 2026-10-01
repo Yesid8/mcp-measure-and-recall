@@ -240,7 +240,7 @@ The package exports the core facts-mcp is built from — `ProtocolServer`, `serv
 Install it from a release tag; it builds itself on install:
 
 ```bash
-npm install github:Yesid8/mcp-measure-and-recall#v0.2.0
+npm install github:Yesid8/mcp-measure-and-recall#v0.2.1
 ```
 
 Use `ProtocolServer` directly, not `build()`: `build()` is facts-mcp, including a store that

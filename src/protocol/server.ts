@@ -212,10 +212,14 @@ export class ProtocolServer {
   }
 
   #describe(full: string, tool: AnyTool): ListedTool {
-    const inputSchema = z.toJSONSchema(tool.input, { target: 'draft-2020-12' }) as Record<
-      string,
-      unknown
-    >
+    // The input schema describes what a caller may SEND: a field with a default
+    // is optional there. zod describes the parsed (output) shape unless told
+    // otherwise, which would publish every defaulted field as required. The
+    // data schema below is what the tool returns, so its output shape is right.
+    const inputSchema = z.toJSONSchema(tool.input, {
+      target: 'draft-2020-12',
+      io: 'input',
+    }) as Record<string, unknown>
     const dataSchema = z.toJSONSchema(tool.output, { target: 'draft-2020-12' }) as Record<
       string,
       unknown
