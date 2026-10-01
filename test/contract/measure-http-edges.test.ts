@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { httpFixture, type HttpFixture } from '../fixtures/http.js'
 import { inProcessClient, readToolResult, type TestClient } from '../fixtures/client.js'
 import { createMeasureHttp } from '../../src/tools/measure-http.js'
-import type { ToolDefinition } from '../../src/kernel/tool.js'
 import type { NetPolicy } from '../../src/policy/net.js'
 
 /** Encodings, methods and redirect edge cases of facts.measure.http. */
@@ -20,7 +19,7 @@ afterEach(async () => {
 
 function open(policy: NetPolicy = { profile: 'loopback', maxRedirects: 3 }): TestClient {
   client = inProcessClient({
-    tools: [createMeasureHttp(policy) as unknown as ToolDefinition<never, never>],
+    tools: [createMeasureHttp(policy)],
   })
   return client
 }

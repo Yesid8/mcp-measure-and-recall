@@ -8,6 +8,7 @@ import {
   UNSUPPORTED_PROTOCOL_VERSION,
   JSONRPC_VERSION,
   LATEST_PROTOCOL_VERSION,
+  LEGACY_PROTOCOL_VERSIONS,
   SUPPORTED_PROTOCOL_VERSIONS,
   MetaKeys,
   failure,
@@ -15,6 +16,7 @@ import {
   type JsonRpcNotification,
   type JsonRpcRequest,
   type JsonRpcResponse,
+  type LegacyProtocolVersion,
   type RequestId,
 } from './jsonrpc.js'
 import { buildEnvelope, WarningCodes, type Envelope, type Warning } from '../kernel/envelope.js'
@@ -22,7 +24,7 @@ import { toIsoWithOffset, type Clock } from '../kernel/clock.js'
 import { IdPrefix, newId } from '../kernel/ulid.js'
 import { normalizeProject } from '../kernel/project.js'
 import { CoreErrors, toolError, type Result, type ToolError } from '../kernel/result.js'
-import type { ToolContext, ToolDefinition } from '../kernel/tool.js'
+import type { AnyTool, ToolContext } from '../kernel/tool.js'
 
 export interface ServerInfo {
   readonly name: string
@@ -33,19 +35,38 @@ export interface ServerInfo {
 export interface ProtocolServerOptions {
   readonly info: ServerInfo
   readonly instructions: string
-  readonly tools: readonly ToolDefinition<never, never>[]
+  readonly tools: readonly AnyTool[]
   readonly clock: Clock
   readonly log: (level: 'debug' | 'info' | 'warn' | 'error', msg: string, fields?: unknown) => void
   /** Deadline for tools that declare no `timeoutMs`. */
   readonly defaultTimeoutMs?: number
   /**
-   * Persists an observation so it can be cited as evidence later.
-   *
-   * Only measure.* observations are recorded: a recall.* result is a reading of
-   * the registry, and citing a reading as evidence of itself would let the
-   * registry become its own source.
+   * Published as `<toolPrefix>.<name>`. Defaults to `facts`; an empty string
+   * publishes the bare names.
+   */
+  readonly toolPrefix?: string
+  /**
+   * Whether every call must carry a `project`, which the core normalizes and
+   * reports in the envelope. Defaults to true. With false the core neither
+   * reads nor reports one, and `ToolContext.project` is empty: for a server
+   * whose caller is identified some other way.
+   */
+  readonly requireProject?: boolean
+  /**
+   * Persists an observation so it can be cited as evidence later. Called only
+   * for tools marked `records`: a read of a registry is not evidence of itself.
+   * Without it, the core writes nothing anywhere.
    */
   readonly recordObservation?: (envelope: Envelope<unknown>) => Promise<Result<void>>
+}
+
+/**
+ * What one connection remembers. Only the session-based era needs anything:
+ * after `initialize`, its requests carry no `_meta` envelope and the negotiated
+ * version stands for them. A 2026-07-28 client never writes here.
+ */
+export interface Session {
+  legacyVersion?: LegacyProtocolVersion
 }
 
 interface ListedTool {
@@ -57,7 +78,16 @@ interface ListedTool {
   readonly annotations?: Record<string, unknown>
 }
 
-const MODULE_ID = 'facts'
+const DEFAULT_TOOL_PREFIX = 'facts'
+
+/**
+ * What a client that only accepts `[A-Za-z0-9_-]` in tool names shows instead.
+ * Claude Code does this: `facts.recall.query` becomes `facts_recall_query`, and
+ * that rewritten form is the one its permissions and `--allowedTools` use.
+ */
+function clientSafeName(name: string): string {
+  return name.replace(/[^A-Za-z0-9_-]/g, '_')
+}
 
 /** How long a cacheable result stays fresh. Milliseconds, and `>= 0`. */
 const DEFAULT_TTL_MS = 300_000
@@ -121,24 +151,40 @@ function cacheHints(ttlMs: number = DEFAULT_TTL_MS): {
 /**
  * The protocol layer: the only hard boundary in the package.
  *
- * Implements MCP 2026-07-28 directly against the normative schema. Why, and the
- * spike that may replace it with @modelcontextprotocol/server: docs/adr/0002.
+ * Implements MCP 2026-07-28 directly against the normative schema, and the
+ * session-based 2025 revisions that deployed clients still open with
+ * `initialize` (ADR-0004). Why not the SDK, and the spike that may replace this
+ * with @modelcontextprotocol/server: docs/adr/0002.
  */
 export class ProtocolServer {
-  readonly #tools = new Map<string, ToolDefinition<never, never>>()
+  readonly #tools = new Map<string, AnyTool>()
   readonly #listed: readonly ListedTool[]
   readonly #discover: Record<string, unknown>
   readonly #opts: ProtocolServerOptions
+  readonly #requireProject: boolean
   readonly #inFlight = new Map<RequestId, AbortController>()
   /** Every tools/call not yet answered, so shutdown can wait for them. */
   readonly #pending = new Set<Promise<unknown>>()
 
   constructor(opts: ProtocolServerOptions) {
     this.#opts = opts
+    this.#requireProject = opts.requireProject ?? true
+    const prefix = opts.toolPrefix ?? DEFAULT_TOOL_PREFIX
 
+    const clientNames = new Map<string, string>()
     for (const tool of opts.tools) {
-      const full = `${MODULE_ID}.${tool.name}`
+      const full = prefix === '' ? tool.name : `${prefix}.${tool.name}`
       if (this.#tools.has(full)) throw new Error(`duplicate tool name: ${full}`)
+      // Two names that differ only in punctuation would be one tool on a
+      // client that rewrites it, and which of them it calls is anyone's guess.
+      const safe = clientSafeName(full)
+      const clash = clientNames.get(safe)
+      if (clash !== undefined) {
+        throw new Error(
+          `tool names ${clash} and ${full} collide as ${safe} on clients that rewrite punctuation to underscores`,
+        )
+      }
+      clientNames.set(safe, full)
       this.#tools.set(full, tool)
     }
 
@@ -165,7 +211,7 @@ export class ProtocolServer {
     }
   }
 
-  #describe(full: string, tool: ToolDefinition<never, never>): ListedTool {
+  #describe(full: string, tool: AnyTool): ListedTool {
     const inputSchema = z.toJSONSchema(tool.input, { target: 'draft-2020-12' }) as Record<
       string,
       unknown
@@ -181,7 +227,7 @@ export class ProtocolServer {
       inputSchema,
       // The published outputSchema describes the WHOLE envelope, not just data,
       // so the client can validate the entire response.
-      outputSchema: envelopeSchema(dataSchema),
+      outputSchema: envelopeSchema(dataSchema, this.#requireProject),
       ...(tool.annotations !== undefined
         ? { annotations: tool.annotations as Record<string, unknown> }
         : {}),
@@ -227,8 +273,11 @@ export class ProtocolServer {
    * `null`, a number or a batch array must be answered with -32600 rather than
    * reach code that assumes an object — a thrown TypeError leaves the client
    * waiting for a response that never comes.
+   *
+   * `session` is what this connection negotiated; a transport keeps one per
+   * connection. Without it, `initialize` is still answered but not remembered.
    */
-  async handle(raw: unknown): Promise<JsonRpcResponse | null> {
+  async handle(raw: unknown, session: Session = {}): Promise<JsonRpcResponse | null> {
     const shape = this.#classify(raw)
     if (shape.kind === 'invalid') return shape.response
     if (shape.kind === 'ignore') return null
@@ -243,33 +292,36 @@ export class ProtocolServer {
     const req = shape.msg
     const id = req.id
 
-    // A legacy client sends initialize. It has no way to move forward, and this
-    // message is the only diagnostic its user will ever see.
-    if (req.method === 'initialize') {
-      return failure(
-        id,
-        UNSUPPORTED_PROTOCOL_VERSION,
-        `this server implements MCP ${LATEST_PROTOCOL_VERSION}, which removed the initialize handshake; supported versions: ${SUPPORTED_PROTOCOL_VERSIONS.join(', ')}`,
-        { supported: [...SUPPORTED_PROTOCOL_VERSIONS], ...this.#errorTime() },
-      )
-    }
+    if (req.method === 'initialize') return this.#initialize(req, session)
+    // Both eras' clients may probe liveness; it touches nothing.
+    if (req.method === 'ping') return success(id, {})
 
     // server/discover is the compatibility probe: a client may call it before
     // anything else, so it is exempt from the _meta requirements.
     if (req.method === 'server/discover') return success(id, this.#discover)
 
-    const metaCheck = this.#checkMeta(req)
-    if (metaCheck !== null) return failure(id, metaCheck.code, metaCheck.message, metaCheck.data)
+    // A request that carries its own envelope is 2026-07-28 whatever the
+    // connection negotiated; one without it is served under the session's
+    // version, if `initialize` opened one.
+    const legacy = session.legacyVersion !== undefined && !carriesProtocolVersion(req)
+    if (!legacy) {
+      const metaCheck = this.#checkMeta(req)
+      if (metaCheck !== null) {
+        return failure(id, metaCheck.code, metaCheck.message, metaCheck.data)
+      }
+    }
 
     switch (req.method) {
       case 'tools/list':
-        return success(id, {
-          resultType: 'complete',
-          tools: this.#listed,
-          ...cacheHints(),
-        })
+        // The 2025 era has neither resultType nor cache hints.
+        return success(
+          id,
+          legacy
+            ? { tools: this.#listed }
+            : { resultType: 'complete', tools: this.#listed, ...cacheHints() },
+        )
       case 'tools/call': {
-        const call = this.#call(req)
+        const call = this.#call(req, legacy)
         this.#pending.add(call)
         const done = (): void => void this.#pending.delete(call)
         call.then(done, done)
@@ -341,6 +393,24 @@ export class ProtocolServer {
     }
   }
 
+  /**
+   * The 2025-era handshake. The connection takes the client's version when it
+   * is one of LEGACY_PROTOCOL_VERSIONS and the highest of them otherwise; per
+   * that era's rules, a client that cannot speak the answer disconnects.
+   */
+  #initialize(req: JsonRpcRequest, session: Session): JsonRpcResponse {
+    const requested = req.params?.['protocolVersion']
+    const version =
+      LEGACY_PROTOCOL_VERSIONS.find((v) => v === requested) ?? LEGACY_PROTOCOL_VERSIONS[0]
+    session.legacyVersion = version
+    return success(req.id, {
+      protocolVersion: version,
+      capabilities: { tools: { listChanged: false } },
+      serverInfo: { name: this.#opts.info.name, version: this.#opts.info.version },
+      instructions: this.#opts.instructions,
+    })
+  }
+
   #errorTime(): Record<string, unknown> {
     // N1 has no exceptions: error responses carry the time too.
     return { observed_at: toIsoWithOffset(this.#opts.clock.now()), age_seconds: 0 }
@@ -353,7 +423,7 @@ export class ProtocolServer {
     if (typeof version !== 'string') {
       return {
         code: INVALID_PARAMS,
-        message: `missing required _meta field: ${MetaKeys.protocolVersion}`,
+        message: `missing required _meta field: ${MetaKeys.protocolVersion}; a ${LEGACY_PROTOCOL_VERSIONS.join(' or ')} client must send initialize first`,
         data: this.#errorTime(),
       }
     }
@@ -376,7 +446,7 @@ export class ProtocolServer {
     return null
   }
 
-  async #call(req: JsonRpcRequest): Promise<JsonRpcResponse | null> {
+  async #call(req: JsonRpcRequest, legacy: boolean): Promise<JsonRpcResponse | null> {
     const id = req.id
     const name = req.params?.['name']
     if (typeof name !== 'string') {
@@ -415,21 +485,32 @@ export class ProtocolServer {
     // What every envelope from this call shares, whichever path it takes.
     const base = { tool: name, requestId, startedMonotonic, startedAt, clock: this.#opts.clock }
     const asToolError = (
-      project: string,
+      project: string | undefined,
       target: Readonly<Record<string, unknown>>,
       error: ToolError,
     ): JsonRpcResponse =>
       success(
         id,
-        this.#toolResult(buildEnvelope({ ...base, project, target, data: null, error }), true),
+        this.#toolResult(
+          buildEnvelope({
+            ...base,
+            ...(project !== undefined ? { project } : {}),
+            target,
+            data: null,
+            error,
+          }),
+          true,
+          legacy,
+        ),
       )
 
     // Invalid arguments are a TOOL error, not a JSON-RPC error: the model can
     // read the zod detail and correct itself on the next call.
     const parsed = tool.input.safeParse(args)
     if (!parsed.success) {
+      const rawProject = typeof rawArgs['project'] === 'string' ? rawArgs['project'] : ''
       return asToolError(
-        typeof rawArgs['project'] === 'string' ? rawArgs['project'] : '',
+        this.#requireProject ? rawProject : undefined,
         rawArgs,
         toolError(CoreErrors.INVALID_INPUT, 'arguments do not match the tool schema', {
           detail: {
@@ -443,11 +524,17 @@ export class ProtocolServer {
       )
     }
 
-    const input = parsed.data as Record<string, unknown>
-    const projectRaw = typeof input['project'] === 'string' ? input['project'] : ''
-    const normalized = normalizeProject(projectRaw)
-    if (!normalized.ok) {
-      return asToolError(projectRaw, tool.target(parsed.data as never), normalized.error)
+    let input = parsed.data as Record<string, unknown>
+    let project: string | undefined
+    if (this.#requireProject) {
+      const projectRaw = typeof input['project'] === 'string' ? input['project'] : ''
+      const normalized = normalizeProject(projectRaw)
+      if (!normalized.ok) {
+        return asToolError(projectRaw, tool.target(parsed.data as never), normalized.error)
+      }
+      project = normalized.value
+      // The handler sees the normalized form, the same one the envelope reports.
+      input = { ...input, project }
     }
 
     const timeoutMs = tool.timeoutMs ?? this.#opts.defaultTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS
@@ -465,14 +552,14 @@ export class ProtocolServer {
     const ctx: ToolContext = {
       signal: controller.signal,
       clock: this.#opts.clock,
-      project: normalized.value,
+      project: project ?? '',
       warn: (w) => warnings.push(w),
     }
 
     let data: unknown = null
     let error: ToolError | null = null
     try {
-      const running = tool.handler({ ...input, project: normalized.value } as never, ctx)
+      const running = tool.handler(input as never, ctx)
       // Once abandoned below, its eventual rejection has nobody to reach.
       running.catch(() => {})
       const out = await Promise.race([running, abandonAfterAbort(controller.signal)])
@@ -505,20 +592,20 @@ export class ProtocolServer {
 
     let envelope = buildEnvelope({
       ...base,
-      project: normalized.value,
+      ...(project !== undefined ? { project } : {}),
       target: tool.target(parsed.data as never),
       data,
       error,
       warnings,
     })
 
-    // Measurements become citable evidence, failed ones included: a refused
+    // Observations become citable evidence, failed ones included: a refused
     // connection is as much a fact as a 200. A refusal by the server itself
-    // observed nothing, and a reading of the registry is not evidence of itself.
+    // observed nothing.
     if (
       this.#opts.recordObservation !== undefined &&
-      (error === null || !NOT_AN_OBSERVATION.has(error.code)) &&
-      name.startsWith(`${MODULE_ID}.measure.`)
+      tool.records === true &&
+      (error === null || !NOT_AN_OBSERVATION.has(error.code))
     ) {
       const recorded = await this.#recordSafely(envelope)
       if (!recorded.ok) {
@@ -539,7 +626,7 @@ export class ProtocolServer {
       }
     }
 
-    return success(id, this.#toolResult(envelope, error !== null))
+    return success(id, this.#toolResult(envelope, error !== null, legacy))
   }
 
   /** Persisting must never fail the measurement the caller already holds. */
@@ -562,17 +649,36 @@ export class ProtocolServer {
     }
   }
 
-  #toolResult(envelope: unknown, isError: boolean): Record<string, unknown> {
-    return {
-      resultType: 'complete',
+  /**
+   * The text content repeats the structured one for clients that read only
+   * text. A 2025-era result has no `resultType`, and its serverInfo travelled
+   * once, in the `initialize` answer, rather than on every result.
+   */
+  #toolResult(envelope: unknown, isError: boolean, legacy: boolean): Record<string, unknown> {
+    const result = {
       content: [{ type: 'text', text: JSON.stringify(envelope) }],
       structuredContent: envelope,
       isError,
+    }
+    if (legacy) return result
+    return {
+      resultType: 'complete',
+      ...result,
       _meta: {
         [MetaKeys.serverInfo]: { name: this.#opts.info.name, version: this.#opts.info.version },
       },
     }
   }
+}
+
+/** Whether a request carries the 2026-07-28 per-request envelope. */
+function carriesProtocolVersion(req: JsonRpcRequest): boolean {
+  const meta = req.params?.['_meta']
+  return (
+    meta !== null &&
+    typeof meta === 'object' &&
+    typeof (meta as Record<string, unknown>)[MetaKeys.protocolVersion] === 'string'
+  )
 }
 
 /**
@@ -603,9 +709,13 @@ function abandonAfterAbort(signal: AbortSignal): Promise<Result<never>> {
  * `data` is null whenever `error` is set, so the schema must admit null: a
  * client that validates structuredContent against outputSchema — as the v2 SDK
  * does — would otherwise reject every tool error. `$schema` is lifted out of the
- * nested schema because it is only meaningful at a document root.
+ * nested schema because it is only meaningful at a document root. `project` is
+ * there only when the server requires one.
  */
-function envelopeSchema(dataSchema: Record<string, unknown>): Record<string, unknown> {
+function envelopeSchema(
+  dataSchema: Record<string, unknown>,
+  withProject: boolean,
+): Record<string, unknown> {
   const { $schema: _nested, ...data } = dataSchema
   return {
     $schema: 'https://json-schema.org/draft/2020-12/schema',
@@ -614,7 +724,9 @@ function envelopeSchema(dataSchema: Record<string, unknown>): Record<string, unk
       observation_id: { type: 'string', description: 'Citable id of this observation.' },
       request_id: { type: 'string', description: 'The request that produced it.' },
       tool: { type: 'string', description: 'Full tool name.' },
-      project: { type: 'string', description: 'The normalized project.' },
+      ...(withProject
+        ? { project: { type: 'string', description: 'The normalized project.' } }
+        : {}),
       target: { type: 'object', description: 'Effective arguments, redacted.' },
       observed_at: { type: 'string', description: 'ISO 8601 with offset.' },
       age_seconds: { type: 'number', description: 'Seconds since observed_at.' },
@@ -636,7 +748,7 @@ function envelopeSchema(dataSchema: Record<string, unknown>): Record<string, unk
       'observation_id',
       'request_id',
       'tool',
-      'project',
+      ...(withProject ? ['project'] : []),
       'target',
       'observed_at',
       'age_seconds',

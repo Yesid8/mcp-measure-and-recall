@@ -13,7 +13,7 @@ import { ProtocolServer } from '../../src/protocol/server.js'
 import { captureConsole, serveStdio } from '../../src/transport/stdio.js'
 import { INVALID_REQUEST, LATEST_PROTOCOL_VERSION, MetaKeys } from '../../src/protocol/jsonrpc.js'
 import { inProcessClient, readToolResult, type TestClient } from '../fixtures/client.js'
-import { defineTool, type ToolDefinition } from '../../src/kernel/tool.js'
+import { defineTool } from '../../src/kernel/tool.js'
 import { Err, Ok } from '../../src/kernel/result.js'
 import { z } from 'zod'
 
@@ -204,11 +204,12 @@ describe('a measurement that cannot be stored says so', () => {
       output: z.object({ v: z.number().describe('v') }).strict(),
       target: (i) => ({ project: i.project }),
       handler: async () => Ok({ v: 1 }),
+      records: true,
     })
     const server = new ProtocolServer({
       info: { name: 't', version: '0' },
       instructions: '',
-      tools: [probe as unknown as ToolDefinition<never, never>],
+      tools: [probe],
       clock: new SystemClock(),
       log: () => {},
       recordObservation: async () => Err(toolError('STORAGE_ERROR', 'disk full')),

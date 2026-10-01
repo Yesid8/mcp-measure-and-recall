@@ -5,7 +5,6 @@ import { inProcessClient, readToolResult, type TestClient } from '../fixtures/cl
 import { createMeasureHttp } from '../../src/tools/measure-http.js'
 import { resolveAndValidate } from '../../src/policy/net.js'
 import { classifyIp } from '../../src/policy/ip.js'
-import type { ToolDefinition } from '../../src/kernel/tool.js'
 import type { NetPolicy } from '../../src/policy/net.js'
 
 /**
@@ -26,7 +25,7 @@ afterEach(async () => {
 
 function withPolicy(policy: NetPolicy): TestClient {
   return inProcessClient({
-    tools: [createMeasureHttp(policy) as unknown as ToolDefinition<never, never>],
+    tools: [createMeasureHttp(policy)],
   })
 }
 

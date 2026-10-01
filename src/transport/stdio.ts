@@ -1,7 +1,7 @@
 import type { Readable, Writable } from 'node:stream'
 import { StringDecoder } from 'node:string_decoder'
 import { INTERNAL_ERROR, PARSE_ERROR, failure } from '../protocol/jsonrpc.js'
-import type { ProtocolServer } from '../protocol/server.js'
+import type { ProtocolServer, Session } from '../protocol/server.js'
 import { redact, redactText } from '../kernel/redact.js'
 import { toIsoWithOffset } from '../kernel/clock.js'
 
@@ -116,6 +116,8 @@ export function serveStdio(server: ProtocolServer, opts: StdioOptions = {}): () 
   // the incomplete bytes over to the next chunk.
   const decoder = new StringDecoder('utf8')
   let pending = ''
+  // One process, one connection: whatever initialize negotiates holds for it.
+  const session: Session = {}
 
   const send = (payload: unknown): void => {
     stdout.write(JSON.stringify(payload) + '\n')
@@ -154,7 +156,7 @@ export function serveStdio(server: ProtocolServer, opts: StdioOptions = {}): () 
       return
     }
     try {
-      const res = await server.handle(msg)
+      const res = await server.handle(msg, session)
       if (res !== null) send(res)
     } catch (e) {
       // handle() validates its input, so reaching this is a bug. The request

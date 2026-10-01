@@ -217,8 +217,14 @@ exists to save.
 
 ## Protocol
 
-Implements MCP `2026-07-28` — the stateless revision: no `initialize` handshake, no sessions,
-`server/discover` required, `resultType` on every result.
+Speaks both eras of MCP, chosen per connection by the client's first message:
+
+- **`2025-06-18` and `2025-11-25`**, opened with `initialize` — what Claude Code and most
+  clients use today.
+- **`2026-07-28`**, the stateless revision: `server/discover`, a `_meta` envelope on every
+  request, `resultType` on every result.
+
+Nothing to configure. See [ADR-0004](docs/adr/0004-hablar-tambien-la-era-de-sesion.md).
 
 The wire format is implemented directly against the normative schema, which is vendored in
 `vendor/` and checked against the implementation at compile time. The official SDK for this
@@ -226,6 +232,22 @@ revision exists as `@modelcontextprotocol/server` 2.0; whether to adopt it is a 
 decision still to be taken, and every protocol detail lives behind `src/protocol/` so that
 swapping it touches nothing else. See [ADR-0001](docs/adr/0001-implementar-protocolo-sin-sdk.md)
 and [ADR-0002](docs/adr/0002-el-sdk-v2-se-publico-con-otro-nombre.md).
+
+## Building your own server on the core
+
+The package exports the core facts-mcp is built from — `ProtocolServer`, `serveStdio`,
+`defineTool`, `Result`, the envelope, redaction — for an MCP server with tools of its own.
+Install it from a release tag; it builds itself on install:
+
+```bash
+npm install github:Yesid8/mcp-measure-and-recall#v0.2.0
+```
+
+Use `ProtocolServer` directly, not `build()`: `build()` is facts-mcp, including a store that
+writes every observation to disk. `ProtocolServer` writes nothing unless given a
+`recordObservation`. Its `toolPrefix` option replaces the `facts.` prefix (`''` for bare
+names) and `requireProject: false` drops the `project` parameter. Example and details in
+[docs/USO.md](docs/USO.md#construir-un-servidor-propio-sobre-el-núcleo).
 
 ## Development
 
@@ -251,7 +273,7 @@ stay `ok: true`, silence on a socket must stay a valid observation, a retraction
 the previous bytes untouched, and a clock jumping backwards must never produce a negative age.
 The mechanical checks of the specification run as ordinary tests too: every schema field
 described, no judgement key in any output, no secret in any file on disk, no socket opened
-under `deny-all`, no application name anywhere in `src/`.
+under `deny-all`, no host:port or API route anywhere in `src/`.
 
 Specification in [docs/](docs/). Prose is in Spanish; code, field names and error codes are
 in English. Contributions: [CONTRIBUTING.md](CONTRIBUTING.md). Security reports:

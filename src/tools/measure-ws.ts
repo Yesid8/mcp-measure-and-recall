@@ -319,6 +319,7 @@ export function createMeasureWs(policy: NetPolicy) {
     input,
     output,
     annotations: { readOnlyHint: true, openWorldHint: true },
+    records: true,
     // Above the 120 s maximum of listen_seconds; the connect budget is bounded
     // separately inside the handler.
     timeoutMs: 130_000,

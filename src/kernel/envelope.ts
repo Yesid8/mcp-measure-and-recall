@@ -33,7 +33,8 @@ export interface Envelope<T> {
   readonly observation_id: string
   readonly request_id: string
   readonly tool: string
-  readonly project: string
+  /** Absent when the server is built with `requireProject: false`. */
+  readonly project?: string
   /** The EFFECTIVE arguments: after defaults, normalization and redaction. */
   readonly target: Readonly<Record<string, unknown>>
 
@@ -56,7 +57,7 @@ export interface Envelope<T> {
 /** What the protocol layer knows about a call when it wraps the result. */
 export interface EnvelopeInit<T> {
   readonly tool: string
-  readonly project: string
+  readonly project?: string
   readonly target: Readonly<Record<string, unknown>>
   readonly requestId: string
   /** Monotonic instant captured when the observation started. */
@@ -83,7 +84,7 @@ export function buildEnvelope<T>(init: EnvelopeInit<T>): Envelope<T> {
     observation_id: newId(IdPrefix.observation),
     request_id: init.requestId,
     tool: init.tool,
-    project: init.project,
+    ...(init.project !== undefined ? { project: init.project } : {}),
     target: redact(init.target) as Readonly<Record<string, unknown>>,
     observed_at: toIsoWithOffset(init.startedAt),
     age_seconds: ageSeconds(elapsedMs),

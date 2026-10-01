@@ -267,6 +267,7 @@ export function createMeasureHttp(policy: NetPolicy) {
     input,
     output,
     annotations: { readOnlyHint: true, openWorldHint: true },
+    records: true,
     // Above the 120 s maximum of timeout_ms, which is the budget that should fire.
     timeoutMs: 130_000,
     target: (i) => ({

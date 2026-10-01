@@ -10,7 +10,6 @@ import {
   UNSUPPORTED_PROTOCOL_VERSION,
 } from '../../src/protocol/jsonrpc.js'
 import { defineTool } from '../../src/kernel/tool.js'
-import type { ToolDefinition } from '../../src/kernel/tool.js'
 import { z } from 'zod'
 import { Ok } from '../../src/kernel/result.js'
 import { mkdtempSync } from 'node:fs'
@@ -85,13 +84,43 @@ describe('§8.3 an older revision is refused with the supported list', () => {
   })
 })
 
-describe('§8.4 initialize names the supported versions', () => {
-  it('is the only diagnostic a legacy client will see', async () => {
+describe('§8.4 a 2025-era client opens a session with initialize (ADR-0004)', () => {
+  it('negotiates, then lists and calls over the same connection without _meta', async () => {
     client = inProcessClient()
-    const res = await client.request('initialize', {}, null)
-    const err = errorOf(res)
-    expect(err.message).toContain(LATEST_PROTOCOL_VERSION)
-    expect(err.code).toBe(UNSUPPORTED_PROTOCOL_VERSION)
+    const init = resultOf(
+      await client.request(
+        'initialize',
+        {
+          protocolVersion: '2025-06-18',
+          capabilities: {},
+          clientInfo: { name: 'c', version: '1' },
+        },
+        null,
+      ),
+    )
+    expect(init['protocolVersion']).toBe('2025-06-18')
+    expect(init['instructions']).toContain('never judges')
+    client.notify('notifications/initialized')
+
+    const list = resultOf(await client.request('tools/list', {}, null))
+    expect((list['tools'] as { name: string }[]).length).toBe(6)
+
+    const out = readToolResult(
+      await client.request(
+        'tools/call',
+        { name: 'facts.recall.query', arguments: { project: 'p' } },
+        null,
+      ),
+    )
+    expect(out.isError).toBe(false)
+    expect((out.envelope['data'] as { total_matched: number }).total_matched).toBe(0)
+  })
+
+  it('keeps 2026-07-28 working on a fresh connection, with no initialize', async () => {
+    client = inProcessClient()
+    const err = errorOf(await client.request('tools/list', {}, null))
+    expect(err.code).toBe(-32602)
+    expect(resultOf(await client.request('tools/list'))['resultType']).toBe('complete')
   })
 })
 
@@ -189,7 +218,7 @@ describe('§8.10 cancellation aborts the in-flight call', () => {
         return Ok({ done: !ctx.signal.aborted })
       },
     })
-    client = inProcessClient({ tools: [slow as unknown as ToolDefinition<never, never>] })
+    client = inProcessClient({ tools: [slow] })
 
     void client.request('tools/call', { name: 'facts.slow', arguments: { project: 'p' } })
     await new Promise((r) => setTimeout(r, 50))
@@ -216,7 +245,7 @@ describe('§8.11 a throw becomes -32603 with no trace leaked', () => {
         throw new Error('SECRET_STACK_MARKER')
       },
     })
-    client = inProcessClient({ tools: [boom as unknown as ToolDefinition<never, never>] })
+    client = inProcessClient({ tools: [boom] })
 
     const res = await client.request('tools/call', {
       name: 'facts.boom',

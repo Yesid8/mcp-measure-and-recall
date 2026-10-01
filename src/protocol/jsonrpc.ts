@@ -1,5 +1,6 @@
 /**
- * JSON-RPC 2.0 types and error codes for MCP 2026-07-28.
+ * JSON-RPC 2.0 types and error codes for MCP 2026-07-28, plus the versions of
+ * the session-based era still accepted through `initialize` (ADR-0004).
  *
  * Mirrors vendor/mcp-schema-2026-07-28.ts, the normative schema. The wire format
  * is implemented here rather than through @modelcontextprotocol/server; ADR-0001
@@ -8,7 +9,17 @@
 
 export const JSONRPC_VERSION = '2.0'
 export const LATEST_PROTOCOL_VERSION = '2026-07-28'
+/** The stateless revision: every request carries its own `_meta` envelope. */
 export const SUPPORTED_PROTOCOL_VERSIONS = [LATEST_PROTOCOL_VERSION] as const
+
+/**
+ * The session-based revisions, opened with `initialize`, that deployed clients
+ * still speak. Highest first: negotiation answers with the client's version when
+ * it is listed here, and with the first entry otherwise. Both carry
+ * `structuredContent` and `outputSchema`, which every tool result relies on.
+ */
+export const LEGACY_PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18'] as const
+export type LegacyProtocolVersion = (typeof LEGACY_PROTOCOL_VERSIONS)[number]
 
 // Standard JSON-RPC
 export const PARSE_ERROR = -32700

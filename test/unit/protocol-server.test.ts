@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { z } from 'zod'
-import { ProtocolServer, type ProtocolServerOptions } from '../../src/protocol/server.js'
-import { defineTool, type ToolDefinition } from '../../src/kernel/tool.js'
+import {
+  ProtocolServer,
+  type ProtocolServerOptions,
+  type Session,
+} from '../../src/protocol/server.js'
+import { defineTool, type AnyTool, type ToolDefinition } from '../../src/kernel/tool.js'
 import { Err, Ok, toolError } from '../../src/kernel/result.js'
 import { SystemClock } from '../../src/kernel/clock.js'
 import { MetaKeys, LATEST_PROTOCOL_VERSION } from '../../src/protocol/jsonrpc.js'
@@ -18,6 +22,7 @@ function tool(
   name: string,
   handler: ToolDefinition<{ project: string }, { v: number }>['handler'],
   timeoutMs?: number,
+  records?: boolean,
 ) {
   return defineTool({
     name,
@@ -28,10 +33,11 @@ function tool(
     target: (i) => ({ project: i.project }),
     handler,
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-  }) as unknown as ToolDefinition<never, never>
+    ...(records !== undefined ? { records } : {}),
+  })
 }
 
-function server(tools: ToolDefinition<never, never>[], extra: Partial<ProtocolServerOptions> = {}) {
+function server(tools: AnyTool[], extra: Partial<ProtocolServerOptions> = {}) {
   const logs: { level: string; msg: string }[] = []
   const s = new ProtocolServer({
     info: { name: 't', version: '0' },
@@ -218,7 +224,7 @@ describe('notifications', () => {
 })
 
 describe('recording observations', () => {
-  const measure = tool('measure.x', async () => Ok({ v: 1 }))
+  const measure = tool('measure.x', async () => Ok({ v: 1 }), undefined, true)
 
   it('warns, and logs, when recording throws', async () => {
     const { s, logs } = server([measure], {
@@ -232,22 +238,29 @@ describe('recording observations', () => {
     expect(logs.some((l) => l.level === 'error' && l.msg.includes('recordObservation'))).toBe(true)
   })
 
-  it('records only measurements, not reads of the registry', async () => {
+  it('records only tools marked records, whatever their names', async () => {
     const recorded: string[] = []
-    const { s } = server([measure, tool('recall.y', async () => Ok({ v: 1 }))], {
-      recordObservation: async (e) => (recorded.push(e.tool), Ok(undefined)),
-    })
-    await call(s, 'facts.measure.x')
-    await call(s, 'facts.recall.y')
-    expect(recorded).toEqual(['facts.measure.x'])
+    const { s } = server(
+      [
+        measure,
+        tool('recall.y', async () => Ok({ v: 1 })),
+        tool('measure.unmarked', async () => Ok({ v: 1 })),
+        tool('probe', async () => Ok({ v: 1 }), undefined, true),
+      ],
+      { recordObservation: async (e) => (recorded.push(e.tool), Ok(undefined)) },
+    )
+    for (const name of ['measure.x', 'recall.y', 'measure.unmarked', 'probe']) {
+      await call(s, `facts.${name}`)
+    }
+    expect(recorded).toEqual(['facts.measure.x', 'facts.probe'])
   })
 
   it('records a measurement that failed at the destination: that is a fact too', async () => {
     const recorded: boolean[] = []
-    const { s } = server(
-      [tool('measure.z', async () => Err(toolError('CONNECTION_REFUSED', 'nobody home')))],
-      { recordObservation: async (e) => (recorded.push(e.ok), Ok(undefined)) },
-    )
+    const failing = async () => Err(toolError('CONNECTION_REFUSED', 'nobody home'))
+    const { s } = server([tool('measure.z', failing, undefined, true)], {
+      recordObservation: async (e) => (recorded.push(e.ok), Ok(undefined)),
+    })
     await call(s, 'facts.measure.z')
     expect(recorded).toEqual([false])
   })
@@ -256,13 +269,179 @@ describe('recording observations', () => {
     'records nothing when the call was refused before observing (%s)',
     async (code) => {
       const recorded: string[] = []
-      const { s } = server([tool('measure.z', async () => Err(toolError(code, 'refused')))], {
+      const refusing = async () => Err(toolError(code, 'refused'))
+      const { s } = server([tool('measure.z', refusing, undefined, true)], {
         recordObservation: async (e) => (recorded.push(e.tool), Ok(undefined)),
       })
       await call(s, 'facts.measure.z')
       expect(recorded).toEqual([])
     },
   )
+})
+
+describe('toolPrefix', () => {
+  const listNames = async (s: ProtocolServer) =>
+    (
+      (await s.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/list',
+        params: { _meta: META },
+      })) as unknown as {
+        result: { tools: { name: string }[] }
+      }
+    ).result.tools.map((t) => t.name)
+
+  it.each([
+    [undefined, 'facts.echo'],
+    ['planner', 'planner.echo'],
+    ['', 'echo'],
+  ])('publishes and calls with prefix %j as %s', async (toolPrefix, published) => {
+    const { s } = server(
+      [tool('echo', async () => Ok({ v: 1 }))],
+      toolPrefix !== undefined ? { toolPrefix } : {},
+    )
+    expect(await listNames(s)).toEqual([published])
+    const r = envelopeOf(await call(s, published))
+    expect(r.structuredContent.ok).toBe(true)
+  })
+})
+
+describe('tool names that collide on clients rewriting punctuation', () => {
+  it('refuses two names that differ only in . versus _', () => {
+    const noop = async () => Ok({ v: 1 })
+    expect(() => server([tool('a.b', noop), tool('a_b', noop)])).toThrow(/collide as facts_a_b/)
+  })
+
+  it('accepts names that stay distinct once rewritten', () => {
+    const noop = async () => Ok({ v: 1 })
+    expect(() => server([tool('a.b', noop), tool('a.c', noop)])).not.toThrow()
+  })
+})
+
+describe('requireProject: false', () => {
+  const bare = z.object({ q: z.string().describe('q') }).strict()
+  const seen: string[] = []
+  const noProject = defineTool({
+    name: 'lookup',
+    title: 'lookup',
+    description: 'Test scaffolding.',
+    input: bare,
+    output: out,
+    target: (i) => ({ q: i.q }),
+    handler: async (_i, ctx) => (seen.push(ctx.project), Ok({ v: 1 })),
+  })
+
+  it('neither requires nor reports a project, and the context carries none', async () => {
+    const { s } = server([noProject], { requireProject: false })
+    const r = envelopeOf(await call(s, 'facts.lookup', { q: 'x' }))
+    expect(r.structuredContent.ok).toBe(true)
+    expect('project' in r.structuredContent).toBe(false)
+    expect(seen.at(-1)).toBe('')
+  })
+
+  it('leaves project out of the published output schema', async () => {
+    const { s } = server([noProject], { requireProject: false })
+    const res = (await s.handle({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/list',
+      params: { _meta: META },
+    })) as unknown as {
+      result: { tools: { outputSchema: { properties: object; required: string[] } }[] }
+    }
+    const schema = res.result.tools[0]!.outputSchema
+    expect('project' in schema.properties).toBe(false)
+    expect(schema.required).not.toContain('project')
+  })
+
+  it('still requires one by default', async () => {
+    const { s } = server([noProject])
+    const r = envelopeOf(await call(s, 'facts.lookup', { q: 'x' }))
+    expect(r.structuredContent.error?.code).toBe('INVALID_PROJECT')
+  })
+})
+
+describe('the 2025-era session, opened with initialize', () => {
+  const init = (s: ProtocolServer, session: Session, protocolVersion: unknown) =>
+    s.handle(
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion, capabilities: {}, clientInfo: { name: 'c', version: '1' } },
+      },
+      session,
+    ) as Promise<{ result: Record<string, unknown> }>
+
+  it.each([
+    ['2025-06-18', '2025-06-18'],
+    ['2025-11-25', '2025-11-25'],
+    ['2024-11-05', '2025-11-25'], // not ours: answer with the highest we speak
+    ['2026-07-28', '2025-11-25'], // that revision has no initialize
+  ])('negotiates %s as %s', async (asked, agreed) => {
+    const { s } = server([])
+    const session: Session = {}
+    const res = await init(s, session, asked)
+    expect(res.result['protocolVersion']).toBe(agreed)
+    expect(res.result['capabilities']).toEqual({ tools: { listChanged: false } })
+    expect(res.result['serverInfo']).toEqual({ name: 't', version: '0' })
+    expect(session.legacyVersion).toBe(agreed)
+  })
+
+  it('then serves tools/list and tools/call without _meta, in that era’s shape', async () => {
+    const { s } = server([tool('echo', async () => Ok({ v: 1 }))])
+    const session: Session = {}
+    await init(s, session, '2025-06-18')
+    expect(
+      await s.handle({ jsonrpc: '2.0', method: 'notifications/initialized' }, session),
+    ).toBeNull()
+
+    const list = (await s.handle({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, session)) as {
+      result: Record<string, unknown>
+    }
+    expect(Object.keys(list.result)).toEqual(['tools'])
+
+    const called = (await s.handle(
+      {
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: { name: 'facts.echo', arguments: { project: 'p' } },
+      },
+      session,
+    )) as { result: Record<string, unknown> }
+    expect(Object.keys(called.result).sort()).toEqual(['content', 'isError', 'structuredContent'])
+    expect((called.result['structuredContent'] as Envelope).ok).toBe(true)
+  })
+
+  it('still serves a request that carries the 2026-07-28 envelope in its own shape', async () => {
+    const { s } = server([])
+    const session: Session = {}
+    await init(s, session, '2025-06-18')
+    const res = (await s.handle(
+      { jsonrpc: '2.0', id: 2, method: 'tools/list', params: { _meta: META } },
+      session,
+    )) as { result: Record<string, unknown> }
+    expect(res.result['resultType']).toBe('complete')
+  })
+
+  it('requires the envelope on a connection that never sent initialize', async () => {
+    const { s } = server([])
+    const res = (await s.handle({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, {})) as {
+      error: { code: number; message: string }
+    }
+    expect(res.error.code).toBe(-32602)
+    expect(res.error.message).toContain('initialize')
+  })
+
+  it('answers ping in either era', async () => {
+    const { s } = server([])
+    expect(await s.handle({ jsonrpc: '2.0', id: 9, method: 'ping' })).toMatchObject({
+      id: 9,
+      result: {},
+    })
+  })
 })
 
 describe('server/discover', () => {

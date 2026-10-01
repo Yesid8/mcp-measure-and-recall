@@ -17,7 +17,7 @@
 | **A5** — Rodaje con un consumidor real | **aplazada** (la hará el primer consumidor, desde su proyecto) | Ver §4 |
 | **A6** — Documento de traspaso | **completa** | [USO.md](USO.md) |
 
-**450 tests en verde**, unitarios y de contrato. Al cierre de A4 eran 160; el resto los
+**470 tests en verde**, unitarios y de contrato. Al cierre de A4 eran 160; el resto los
 añadieron las revisiones de código posteriores, que cubrieron rutas de error, bordes de
 protocolo y fallos propios de Windows. `typecheck`, `lint`, `format:check` y `test` limpios,
 sin errores sueltos en ejecuciones repetidas, y la CI los repite en Linux y Windows.
@@ -277,6 +277,7 @@ especificación v1 y los ADR. Lo que encontraron, y qué se hizo con cada cosa.
 
 | Documento | Dice | El código hace, y por qué |
 |---|---|---|
+| 03 §1, §8.4 | Solo `2026-07-28`; `initialize` se rechaza | Ambas eras por conexión, `initialize` incluido: Claude Code no conectaba ([ADR-0004](adr/0004-hablar-tambien-la-era-de-sesion.md)) |
 | 05 §4.1 | `body_format: json\|text\|base64\|blob` | `none` en lugar de `blob`: no hay almacén de blobs (pospuesto) y un cuerpo vacío necesita nombre |
 | 05 §6.4 | `ref` con `{tool, http_status}` | `{tool, observed_at}`: vale para toda tool, no solo HTTP |
 | 05 §6.5 | `remeasure_with` con URL y método | Todos los argumentos efectivos menos lo redactado, más `omitted` |

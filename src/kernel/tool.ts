@@ -21,7 +21,10 @@ export interface ToolContext {
   /** Aborted when the client cancels or the call's deadline passes. */
   readonly signal: AbortSignal
   readonly clock: Clock
-  /** Already normalized. */
+  /**
+   * The caller's `project`, already normalized. Empty when the server is built
+   * with `requireProject: false`.
+   */
   readonly project: string
   /** Non-fatal notices, surfaced in the envelope's `warnings`. */
   warn(w: Warning): void
@@ -29,7 +32,7 @@ export interface ToolContext {
 
 /** A tool as the core registers it: schemas, prompt text and the handler. */
 export interface ToolDefinition<I, O> {
-  /** Without module prefix. The core prepends `facts.`. */
+  /** Without prefix. The core publishes it as `<toolPrefix>.<name>`. */
   readonly name: string
   readonly title: string
   /**
@@ -48,6 +51,13 @@ export interface ToolDefinition<I, O> {
    * tool's own, more specific timeout fires first.
    */
   readonly timeoutMs?: number
+  /**
+   * Whether each result is an observation of the world, handed to the server's
+   * `recordObservation` so it can be cited later. Results the server refused
+   * before observing anything are never recorded. Ignored when the server has
+   * no `recordObservation`.
+   */
+  readonly records?: boolean
 
   /**
    * Builds the effective target: the arguments as they were actually used,
@@ -57,6 +67,15 @@ export interface ToolDefinition<I, O> {
 
   readonly handler: (input: I, ctx: ToolContext) => Promise<Result<O>>
 }
+
+/**
+ * A tool of any input and output, as a server's tool list holds them. `any` is
+ * the honest type here: I appears both where it is produced (the schema) and
+ * consumed (the handler), so no single concrete type admits every tool, and a
+ * list typed any narrower makes every caller cast.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type AnyTool = ToolDefinition<any, any>
 
 /** Exists so typing infers I and O from the schemas without annotating them by hand. */
 export function defineTool<I, O>(def: ToolDefinition<I, O>): ToolDefinition<I, O> {

@@ -107,6 +107,10 @@ se erosione.
 
 ### ADR-004 — Soportar solo `2026-07-28`, sin modo *dual-era*
 
+> **Revisada por [ADR-0004](../adr/0004-hablar-tambien-la-era-de-sesion.md)**: los clientes
+> desplegados —Claude Code entre ellos— abren con `initialize` y no conectaban. El servidor
+> habla ahora ambas eras, elegidas por conexión.
+
 **Contexto**: los clientes *legacy* esperan `initialize`. Soportar ambos mundos significa
 dos máquinas de estado, dos modelos de sesión y el doble de tests.
 

@@ -1,6 +1,6 @@
 {
   "name": "@plinth/facts",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "An MCP server that only holds facts: measure and recall, never judge.",
   "license": "0BSD",
   "repository": {
@@ -26,8 +26,12 @@
   "bin": {
     "facts-mcp": "./dist/main.js"
   },
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./dist/index.js"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   },
   "files": [
     "dist",
@@ -45,6 +49,7 @@
     "lint": "oxlint src test",
     "format": "prettier --write \"{src,test}/**/*.ts\"",
     "format:check": "prettier --check \"{src,test}/**/*.ts\"",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {

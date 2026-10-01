@@ -13,7 +13,7 @@ import {
 import { describePolicy } from './config.js'
 import { StoreRegistry } from './store/store.js'
 import { dataRoot } from './store/paths.js'
-import type { ToolDefinition } from './kernel/tool.js'
+import type { AnyTool } from './kernel/tool.js'
 import type { Writable } from 'node:stream'
 import type { Clock } from './kernel/clock.js'
 import type { NetPolicy } from './policy/net.js'
@@ -55,7 +55,7 @@ export interface BuildOptions {
   /** Where the NDJSON log goes. */
   readonly stderr?: Writable
   /** Replaces the six tools. */
-  readonly tools?: readonly ToolDefinition<never, never>[]
+  readonly tools?: readonly AnyTool[]
   /** Defaults to loopback only. main.ts passes the one loadConfig() read. */
   readonly policy?: NetPolicy
   /** recall.* stale threshold when the caller gives none. Defaults to an hour. */
@@ -94,16 +94,14 @@ export function build(opts: BuildOptions = {}): BuiltServer {
   const dir = opts.dataDir ?? dataRoot()
   const stores = new StoreRegistry(clock, dir)
 
-  const tools =
-    opts.tools ??
-    ([
-      createMeasureHttp(policy),
-      createMeasureWs(policy),
-      createRecallAssert(stores, staleSeconds),
-      createRecallRetract(stores, staleSeconds),
-      createRecallQuery(stores, staleSeconds),
-      createRecallHistory(stores, staleSeconds),
-    ] as unknown as readonly ToolDefinition<never, never>[])
+  const tools = opts.tools ?? [
+    createMeasureHttp(policy),
+    createMeasureWs(policy),
+    createRecallAssert(stores, staleSeconds),
+    createRecallRetract(stores, staleSeconds),
+    createRecallQuery(stores, staleSeconds),
+    createRecallHistory(stores, staleSeconds),
+  ]
 
   const server = new ProtocolServer({
     info: { name: 'facts-mcp', version: VERSION },
@@ -112,7 +110,7 @@ export function build(opts: BuildOptions = {}): BuiltServer {
     clock,
     log,
     recordObservation: async (envelope) => {
-      const store = await stores.get(envelope.project)
+      const store = await stores.get(envelope.project ?? '')
       return store.ok ? store.value.recordObservation(envelope) : store
     },
   })
