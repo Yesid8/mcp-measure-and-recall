@@ -4,11 +4,12 @@ import { request as httpsRequest } from 'node:https'
 import { createGunzip, createInflate, createBrotliDecompress } from 'node:zlib'
 import type { Readable, Transform } from 'node:stream'
 import { defineTool, type ToolContext } from '../kernel/tool.js'
-import { CoreErrors, Err, Ok, toolError, type Result } from '../kernel/result.js'
+import { ErrorCodes, Err, Ok, toolError, type Result } from '../kernel/result.js'
 import { WarningCodes } from '../kernel/envelope.js'
 import {
   HTTP_SCHEMES,
   resolveAndValidate,
+  tlsPeer,
   type NetPolicy,
   type ResolvedTarget,
 } from '../policy/net.js'
@@ -152,15 +153,19 @@ async function readBody(
     for await (const chunk of source as AsyncIterable<Buffer>) {
       if (ctx.signal.aborted) {
         res.destroy()
-        return Err(toolError(CoreErrors.CANCELLED, 'cancelled while reading the body'))
+        return Err(toolError(ErrorCodes.CANCELLED, 'cancelled while reading the body'))
       }
       total += chunk.length
       if (stream !== null && rawBytes > 0 && total / rawBytes > MAX_DECOMPRESSION_RATIO) {
         res.destroy()
         return Err(
-          toolError('DECOMPRESSION_LIMIT', 'decompressed body exceeded the 100:1 ratio cap', {
-            detail: { compressed_bytes: rawBytes, decompressed_bytes: total },
-          }),
+          toolError(
+            ErrorCodes.DECOMPRESSION_LIMIT,
+            'decompressed body exceeded the 100:1 ratio cap',
+            {
+              detail: { compressed_bytes: rawBytes, decompressed_bytes: total },
+            },
+          ),
         )
       }
       if (total > maxBytes) {
@@ -173,7 +178,9 @@ async function readBody(
     }
   } catch (e) {
     if (!truncated) {
-      return Err(toolError('BODY_READ_FAILED', 'the response body could not be read', { cause: e }))
+      return Err(
+        toolError(ErrorCodes.BODY_READ_FAILED, 'the response body could not be read', { cause: e }),
+      )
     }
   } finally {
     res.off('data', countRaw)
@@ -215,7 +222,7 @@ function oneShot(
       path: target.url.pathname + target.url.search,
       method: input.method,
       headers,
-      ...(isTls ? { servername: target.hostname, rejectUnauthorized: true } : {}),
+      ...(isTls ? tlsPeer(target) : {}),
       // No environment proxy: a legacy proxy would bypass the whole IP validation.
       agent: false,
       timeout: input.timeout_ms,
@@ -244,7 +251,7 @@ function oneShot(
     })
     req.once('timeout', () => {
       req.destroy()
-      resolve(Err(toolError(CoreErrors.TIMEOUT, `no response within ${input.timeout_ms} ms`)))
+      resolve(Err(toolError(ErrorCodes.TIMEOUT, `no response within ${input.timeout_ms} ms`)))
     })
     // `on`, not `once`: the request can emit a second 'error' — during the body
     // read, after the response already resolved this promise — and an 'error'
@@ -293,9 +300,9 @@ export function createMeasureHttp(policy: NetPolicy) {
       if (out.ok) return out
       // An abort surfaces from deep in the stack under whatever name the layer
       // that noticed gave it; the cause is known here, so name it correctly.
-      if (ctx.signal.aborted) return Err(toolError(CoreErrors.CANCELLED, 'the call was cancelled'))
+      if (ctx.signal.aborted) return Err(toolError(ErrorCodes.CANCELLED, 'the call was cancelled'))
       if (budget.aborted) {
-        return Err(toolError(CoreErrors.TIMEOUT, `no complete response within ${i.timeout_ms} ms`))
+        return Err(toolError(ErrorCodes.TIMEOUT, `no complete response within ${i.timeout_ms} ms`))
       }
       return out
     },
@@ -330,128 +337,179 @@ function withoutKeys(
   )
 }
 
-/** One request, following redirects when asked. The caller owns the time budget. */
+/** The request as it goes out on one hop. Following a redirect may rewrite any of it. */
+interface Hop {
+  readonly url: string
+  readonly method: MeasureHttpInput['method']
+  readonly headers: Readonly<Record<string, string>>
+  readonly body: Buffer | null
+}
 
+/** One request, following redirects when asked. The caller owns the time budget. */
 async function exchange(
   i: MeasureHttpInput,
   ctx: ToolContext,
   policy: NetPolicy,
 ): Promise<Result<MeasureHttpData>> {
   const started = ctx.clock.monotonic()
-  // method and bodyBuf are mutable because a redirect can rewrite them to a
-  // bodyless GET, following the semantics a real client applies.
-  let method = i.method
-  let bodyBuf =
-    i.body === undefined
-      ? null
-      : Buffer.from(typeof i.body === 'string' ? i.body : JSON.stringify(i.body), 'utf8')
-  const redirectChain: { url: string; http_status: number }[] = []
   const maxHops = policy.maxRedirects ?? DEFAULT_MAX_REDIRECTS
-  let currentUrl = i.url
-  let headers: Record<string, string> = { ...i.headers }
-  for (let hop = 0; ; hop++) {
+  const redirectChain: { url: string; http_status: number }[] = []
+  let hop: Hop = {
+    url: i.url,
+    method: i.method,
+    headers: { ...i.headers },
+    body:
+      i.body === undefined
+        ? null
+        : Buffer.from(typeof i.body === 'string' ? i.body : JSON.stringify(i.body), 'utf8'),
+  }
+
+  for (let n = 0; ; n++) {
     // Step 7: every redirect hop repeats the full validation. No exceptions.
-    const validated = await resolveAndValidate(currentUrl, policy, ctx.signal, HTTP_SCHEMES)
+    const validated = await resolveAndValidate(hop.url, policy, ctx.signal, HTTP_SCHEMES)
     if (!validated.ok) return Err(validated.error)
-    const dnsMs = ctx.clock.monotonic() - started
+    // Only the first hop is attributed: later hops resolve again, so null
+    // means "not attributed", not "no DNS happened".
+    const dnsMs = n === 0 ? ctx.clock.monotonic() - started : null
     const shot = await oneShot(
       validated.value,
-      { ...i, url: currentUrl, method, headers },
-      bodyBuf,
+      { ...i, url: hop.url, method: hop.method, headers: { ...hop.headers } },
+      hop.body,
       ctx,
     )
     if (!shot.ok) return Err(shot.error)
-    const { res, peer, timing } = shot.value
-    const status = res.statusCode ?? 0
-    const nextUrl = i.follow_redirects
-      ? redirectTarget(status, res.headers['location'], currentUrl)
-      : null
-    if (nextUrl === 'invalid') {
-      ctx.warn({
-        code: WarningCodes.REDIRECT_NOT_FOLLOWED,
-        message: 'the Location header is not a valid URL; the redirect is returned as received',
-        detail: { location: res.headers['location'] },
-      })
-    } else if (nextUrl !== null && hop >= maxHops) {
-      ctx.warn({
-        code: WarningCodes.REDIRECT_NOT_FOLLOWED,
-        message: `stopped after ${maxHops} redirects; the last one is returned as received`,
-        detail: { max_redirects: maxHops, location: nextUrl.toString() },
-      })
-    } else if (nextUrl !== null) {
-      redirectChain.push({ url: currentUrl, http_status: status })
-      res.resume() // drain, we are not keeping this body
 
-      // Follow the method semantics a real client uses, so remeasure_with
-      // reproduces a request that actually happened. 303 always becomes GET;
-      // 301/302 become GET for anything but GET/HEAD, by universal
-      // convention. This is not interpreting the result — it is behaving as
-      // the client the caller believes they are.
-      if (
-        status === 303 ||
-        ((status === 301 || status === 302) && method !== 'GET' && method !== 'HEAD')
-      ) {
-        method = 'GET'
-        bodyBuf = null
-        // Headers describing the dropped body would describe nothing now.
-        headers = withoutKeys(headers, ['content-type', 'content-length'])
-      }
-
-      // Credentials are scoped to the origin they were given for. The policy
-      // revalidates every hop, but a permitted host is not thereby entitled
-      // to a token meant for another one.
-      if (nextUrl.origin !== new URL(currentUrl).origin) {
-        const kept = stripSecretKeys(headers)
-        if (Object.keys(kept).length !== Object.keys(headers).length) {
-          ctx.warn({
-            code: WarningCodes.CREDENTIALS_DROPPED_ON_REDIRECT,
-            message: 'credential headers were not forwarded across an origin change',
-            detail: { from: new URL(currentUrl).origin, to: nextUrl.origin },
-          })
-        }
-        headers = kept
-      }
-      currentUrl = nextUrl.toString()
-      continue
-    }
-    const read = await readBody(res, i.max_body_bytes, ctx)
-    if (!read.ok) return Err(read.error)
-    const { buf, truncated } = read.value
-    const contentType = String(res.headers['content-type'] ?? '')
-    const { body, format } = decodeBody(buf, contentType, truncated, ctx)
-    if (truncated) {
-      ctx.warn({
-        code: WarningCodes.BODY_TRUNCATED,
-        message: `body was truncated at ${i.max_body_bytes} bytes`,
-        detail: { max_body_bytes: i.max_body_bytes },
+    const status = shot.value.res.statusCode ?? 0
+    const next = i.follow_redirects ? nextHopUrl(shot.value.res, hop.url, n, maxHops, ctx) : null
+    if (next === null) {
+      return observe(shot.value, i, ctx, {
+        dns: dnsMs,
+        total: () => ctx.clock.monotonic() - started,
+        redirectChain,
       })
     }
-    const responseHeaders: Record<string, string> = {}
-    for (const [k, v] of Object.entries(res.headers)) {
-      responseHeaders[k] = Array.isArray(v) ? v.join(', ') : String(v ?? '')
+    redirectChain.push({ url: hop.url, http_status: status })
+    shot.value.res.resume() // drain, we are not keeping this body
+    hop = followTo(hop, status, next, ctx)
+  }
+}
+
+/**
+ * Where to go next: the redirect's target, or null to return this response as
+ * received — because it is not a redirect, its Location does not parse, or the
+ * hop limit is reached. The last two say so in a warning.
+ */
+function nextHopUrl(
+  res: IncomingMessage,
+  currentUrl: string,
+  hopsSoFar: number,
+  maxHops: number,
+  ctx: ToolContext,
+): URL | null {
+  const location = res.headers['location']
+  const next = redirectTarget(res.statusCode ?? 0, location, currentUrl)
+  if (next === 'invalid') {
+    ctx.warn({
+      code: WarningCodes.REDIRECT_NOT_FOLLOWED,
+      message: 'the Location header is not a valid URL; the redirect is returned as received',
+      detail: { location },
+    })
+    return null
+  }
+  if (next !== null && hopsSoFar >= maxHops) {
+    ctx.warn({
+      code: WarningCodes.REDIRECT_NOT_FOLLOWED,
+      message: `stopped after ${maxHops} redirects; the last one is returned as received`,
+      detail: { max_redirects: maxHops, location: next.toString() },
+    })
+    return null
+  }
+  return next
+}
+
+/**
+ * The request for the next hop, behaving as the client the caller believes
+ * they are — so remeasure_with reproduces a request that actually happened.
+ * This is not interpreting the result.
+ */
+function followTo(hop: Hop, status: number, next: URL, ctx: ToolContext): Hop {
+  let { method, body, headers } = hop
+  // 303 always becomes GET; 301/302 become GET for anything but GET/HEAD, by
+  // universal convention. Headers describing the dropped body would describe
+  // nothing now.
+  if (
+    status === 303 ||
+    ((status === 301 || status === 302) && method !== 'GET' && method !== 'HEAD')
+  ) {
+    method = 'GET'
+    body = null
+    headers = withoutKeys(headers, ['content-type', 'content-length'])
+  }
+
+  // Credentials are scoped to the origin they were given for. The policy
+  // revalidates every hop, but a permitted host is not thereby entitled to a
+  // token meant for another one.
+  const from = new URL(hop.url).origin
+  if (next.origin !== from) {
+    const kept = stripSecretKeys(headers)
+    if (Object.keys(kept).length !== Object.keys(headers).length) {
+      ctx.warn({
+        code: WarningCodes.CREDENTIALS_DROPPED_ON_REDIRECT,
+        message: 'credential headers were not forwarded across an origin change',
+        detail: { from, to: next.origin },
+      })
     }
-    return Ok({
-      kind: 'http' as const,
-      http_status: status,
-      status_text: res.statusMessage ?? '',
-      http_version: res.httpVersion,
-      headers: responseHeaders,
-      body,
-      body_format: format,
-      body_bytes: buf.length,
-      body_truncated: truncated,
-      timing_ms: {
-        // Only the first hop is attributed: later hops resolve again, so
-        // null here means "not attributed", not "no DNS happened".
-        dns: hop === 0 ? dnsMs : null,
-        connect: timing.connect,
-        ttfb: timing.ttfb,
-        total: ctx.clock.monotonic() - started,
-      },
-      redirect_chain: redirectChain,
-      peer,
+    headers = kept
+  }
+  return { url: next.toString(), method, headers, body }
+}
+
+/** Reads the final response and turns it into the observation. */
+async function observe(
+  { res, peer, timing }: OneShotResult,
+  i: MeasureHttpInput,
+  ctx: ToolContext,
+  run: {
+    readonly dns: number | null
+    readonly total: () => number
+    readonly redirectChain: readonly { url: string; http_status: number }[]
+  },
+): Promise<Result<MeasureHttpData>> {
+  const read = await readBody(res, i.max_body_bytes, ctx)
+  if (!read.ok) return Err(read.error)
+  const { buf, truncated } = read.value
+  const contentType = String(res.headers['content-type'] ?? '')
+  const { body, format } = decodeBody(buf, contentType, truncated, ctx)
+  if (truncated) {
+    ctx.warn({
+      code: WarningCodes.BODY_TRUNCATED,
+      message: `body was truncated at ${i.max_body_bytes} bytes`,
+      detail: { max_body_bytes: i.max_body_bytes },
     })
   }
+  const headers: Record<string, string> = {}
+  for (const [k, v] of Object.entries(res.headers)) {
+    headers[k] = Array.isArray(v) ? v.join(', ') : String(v ?? '')
+  }
+  return Ok({
+    kind: 'http' as const,
+    http_status: res.statusCode ?? 0,
+    status_text: res.statusMessage ?? '',
+    http_version: res.httpVersion,
+    headers,
+    body,
+    body_format: format,
+    body_bytes: buf.length,
+    body_truncated: truncated,
+    timing_ms: {
+      dns: run.dns,
+      connect: timing.connect,
+      ttfb: timing.ttfb,
+      total: run.total(),
+    },
+    redirect_chain: [...run.redirectChain],
+    peer,
+  })
 }
 
 function decodeBody(

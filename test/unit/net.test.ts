@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   HTTP_SCHEMES,
   resolveAndValidate,
+  tlsPeer,
   WS_SCHEMES,
   type NetPolicy,
 } from '../../src/policy/net.js'
@@ -95,6 +96,28 @@ describe('resolveAndValidate', () => {
     expect(performance.now() - started).toBeLessThan(500)
   })
 
+  it('does not start a lookup for a call already cancelled', async () => {
+    const c = new AbortController()
+    c.abort()
+    let asked = false
+    const r = await resolveAndValidate(
+      'http://name.test/',
+      { ...loopback, resolver: async () => ((asked = true), []) },
+      c.signal,
+    )
+    expect(!r.ok && r.error.code).toBe('CANCELLED')
+    expect(asked).toBe(false)
+  })
+
+  it('reports a failed lookup as DNS_FAILURE while a signal is attached', async () => {
+    const r = await resolveAndValidate(
+      'http://nowhere.test/',
+      { ...loopback, resolver: resolver({}) },
+      new AbortController().signal,
+    )
+    expect(!r.ok && r.error.code).toBe('DNS_FAILURE')
+  })
+
   it.each([
     ['ws://127.0.0.1/', HTTP_SCHEMES],
     ['https://127.0.0.1/', WS_SCHEMES],
@@ -117,6 +140,19 @@ describe('resolveAndValidate', () => {
   ])('%s targets port %i', async (url, port) => {
     const r = await resolveAndValidate(url, loopback)
     expect(r.ok && r.value.port).toBe(port)
+  })
+
+  it('sends SNI for a name, and none for an IP literal (RFC 6066)', async () => {
+    const named = await resolveAndValidate('https://app.localhost/', {
+      ...loopback,
+      resolver: resolver({ 'app.localhost': [{ address: '127.0.0.1', family: 4 }] }),
+    })
+    expect(named.ok && tlsPeer(named.value)).toEqual({
+      servername: 'app.localhost',
+      rejectUnauthorized: true,
+    })
+    const literal = await resolveAndValidate('https://127.0.0.1/', loopback)
+    expect(literal.ok && tlsPeer(literal.value)).toEqual({ rejectUnauthorized: true })
   })
 
   it('pins a bracketed IPv6 literal without brackets', async () => {

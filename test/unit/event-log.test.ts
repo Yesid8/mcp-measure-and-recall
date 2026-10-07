@@ -108,6 +108,86 @@ describe('append', () => {
     expect(events.map((e) => e.key)).toEqual(['a', 'd'])
     expect(warnings).toEqual([])
   })
+
+  it('never hands a write that failed to the views', async () => {
+    const { log, path } = await openLog()
+    await log.append('assert', 'a', { n: 1 })
+    expect((await log.history('a')).events).toHaveLength(1) // views built
+    await tearNextWrite(path)
+    await log.append('assert', 'b', { n: 2 })
+
+    expect((await log.history('b')).events).toEqual([])
+    await log.append('assert', 'c', { n: 3 })
+    expect((await log.historyOf(['a', 'b', 'c'])).byKey.get('c')?.[0]?.seq).toBe(2)
+  })
+})
+
+describe('views', () => {
+  /** A view that counts how often the log rebuilt it. */
+  function countingView() {
+    const seen: string[] = []
+    let resets = 0
+    return {
+      view: {
+        reset: () => {
+          resets++
+          seen.length = 0
+        },
+        apply: (e: { key: string }) => void seen.push(e.key),
+      },
+      seen,
+      resets: () => resets,
+    }
+  }
+
+  it('builds once, then follows appends without reading the file again', async () => {
+    const { log } = await openLog()
+    await log.append('assert', 'a', { n: 1 })
+    const counter = countingView()
+    log.attach(counter.view)
+
+    await log.refresh()
+    for (let n = 2; n <= 6; n++) {
+      await log.append('assert', `k${n}`, { n })
+      await log.history(`k${n}`)
+    }
+    expect(counter.resets()).toBe(1)
+    expect(counter.seen).toEqual(['a', 'k2', 'k3', 'k4', 'k5', 'k6'])
+  })
+
+  it('rebuilds when the file changed behind the process, and reports what it found', async () => {
+    const { log, path } = await openLog()
+    await log.append('assert', 'a', { n: 1 })
+    const counter = countingView()
+    log.attach(counter.view)
+    await log.refresh()
+
+    appendFileSync(path, 'not json\n')
+    const warnings = await log.refresh()
+    expect(counter.resets()).toBe(2)
+    expect(warnings.map((w) => w.code)).toContain('LOG_LINE_UNREADABLE')
+  })
+
+  it('locates lines by bytes, so multibyte text before them does not shift them', async () => {
+    const { log } = await openLog()
+    await log.append('assert', 'a', { n: 1, note: 'ñandú — verificación' } as never)
+    await log.append('assert', 'b', { n: 2 })
+    expect((await log.history('b')).events[0]?.body).toEqual({ n: 2 })
+    // And again after a rebuild, which computes offsets from the file itself.
+    log.attach(countingView().view)
+    expect((await log.history('b')).events[0]?.body).toEqual({ n: 2 })
+  })
+
+  it('reads a located line back as null once it was edited by hand', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'plinth-log-')), 'l.jsonl')
+    writeFileSync(path, line(1, 'a') + '\n')
+    const { log } = await openLog(path)
+    const at: { offset: number; length: number }[] = []
+    log.attach({ reset: () => (at.length = 0), apply: (_e, where) => void at.push(where) })
+    await log.refresh()
+    writeFileSync(path, 'x'.repeat(at[0]!.length) + '\n')
+    expect(await log.read(at)).toEqual([null])
+  })
 })
 
 describe('open', () => {

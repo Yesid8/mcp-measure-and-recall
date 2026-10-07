@@ -1,4 +1,4 @@
-import { CoreErrors, toolError, type ToolError } from '../kernel/result.js'
+import { ErrorCodes, toolError, type ToolError } from '../kernel/result.js'
 
 /**
  * Shared decoding for the measure.* tools.
@@ -19,28 +19,36 @@ import { CoreErrors, toolError, type ToolError } from '../kernel/result.js'
 export function mapSocketError(e: NodeJS.ErrnoException): ToolError {
   switch (e.code) {
     case 'ECONNREFUSED':
-      return toolError('CONNECTION_REFUSED', 'nothing is listening on that address and port', {
-        cause: e,
-      })
+      return toolError(
+        ErrorCodes.CONNECTION_REFUSED,
+        'nothing is listening on that address and port',
+        {
+          cause: e,
+        },
+      )
     case 'ENOTFOUND':
     case 'EAI_AGAIN':
-      return toolError('DNS_FAILURE', 'the host could not be resolved', { cause: e })
+      return toolError(ErrorCodes.DNS_FAILURE, 'the host could not be resolved', { cause: e })
     case 'ETIMEDOUT':
-      return toolError(CoreErrors.TIMEOUT, 'the connection timed out', { cause: e })
+      return toolError(ErrorCodes.TIMEOUT, 'the connection timed out', { cause: e })
     case 'ECONNRESET':
-      return toolError('CONNECTION_RESET', 'the connection was reset by the peer', { cause: e })
+      return toolError(ErrorCodes.CONNECTION_RESET, 'the connection was reset by the peer', {
+        cause: e,
+      })
     case 'EPIPE':
-      return toolError('CONNECTION_RESET', 'the connection closed while writing', { cause: e })
+      return toolError(ErrorCodes.CONNECTION_RESET, 'the connection closed while writing', {
+        cause: e,
+      })
     case 'ABORT_ERR':
-      return toolError(CoreErrors.CANCELLED, 'the call was cancelled', { cause: e })
+      return toolError(ErrorCodes.CANCELLED, 'the call was cancelled', { cause: e })
     case 'EHOSTUNREACH':
     case 'ENETUNREACH':
-      return toolError('HOST_UNREACHABLE', 'no route to that address', { cause: e })
+      return toolError(ErrorCodes.HOST_UNREACHABLE, 'no route to that address', { cause: e })
     default:
       if (isTlsFailure(e)) {
-        return toolError('TLS_ERROR', `TLS handshake failed: ${e.message}`, { cause: e })
+        return toolError(ErrorCodes.TLS_ERROR, `TLS handshake failed: ${e.message}`, { cause: e })
       }
-      return toolError('CONNECTION_FAILED', e.message, { cause: e })
+      return toolError(ErrorCodes.CONNECTION_FAILED, e.message, { cause: e })
   }
 }
 

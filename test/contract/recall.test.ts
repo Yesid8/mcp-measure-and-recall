@@ -42,6 +42,17 @@ async function measureOk(c: TestClient, project: string, path = '/ok') {
   return out.envelope['observation_id'] as string
 }
 
+/** Asserts a claim citing one observation, and returns its id. */
+async function assertCiting(c: TestClient, observationId: string, statement = 'a claim') {
+  const out = await call(c, 'facts.recall.assert', {
+    project: 'p',
+    statement,
+    evidence: [{ type: 'observation', observation_id: observationId }],
+    observed_by: 'test-agent',
+  })
+  return (out.envelope['data'] as { claim_id: string }).claim_id
+}
+
 const claimsPath = (project: string) => join(dataDir, 'projects', project, 'logs', 'claims.jsonl')
 
 describe('a claim needs evidence and an author', () => {
@@ -154,14 +165,7 @@ describe('nothing is ever deleted', () => {
 
   it('history returns both events in order', async () => {
     client = open()
-    const obs = await measureOk(client, 'p')
-    const asserted = await call(client, 'facts.recall.assert', {
-      project: 'p',
-      statement: 'a claim',
-      evidence: [{ type: 'observation', observation_id: obs }],
-      observed_by: 'test-agent',
-    })
-    const claimId = (asserted.envelope['data'] as { claim_id: string }).claim_id
+    const claimId = await assertCiting(client, await measureOk(client, 'p'))
     await call(client, 'facts.recall.retract', {
       project: 'p',
       claim_id: claimId,
@@ -210,14 +214,7 @@ describe('nothing is ever deleted', () => {
 
   it('retracting twice reports it and writes no second line', async () => {
     client = open()
-    const obs = await measureOk(client, 'p')
-    const asserted = await call(client, 'facts.recall.assert', {
-      project: 'p',
-      statement: 'a claim',
-      evidence: [{ type: 'observation', observation_id: obs }],
-      observed_by: 'test-agent',
-    })
-    const claimId = (asserted.envelope['data'] as { claim_id: string }).claim_id
+    const claimId = await assertCiting(client, await measureOk(client, 'p'))
     await call(client, 'facts.recall.retract', {
       project: 'p',
       claim_id: claimId,
@@ -353,13 +350,7 @@ describe('recall never measures', () => {
 
   it('hands back remeasure_with instead of pretending to know the current state', async () => {
     client = open()
-    const obs = await measureOk(client, 'p')
-    await call(client, 'facts.recall.assert', {
-      project: 'p',
-      statement: 'GET /ok responded 200',
-      evidence: [{ type: 'observation', observation_id: obs }],
-      observed_by: 'test-agent',
-    })
+    await assertCiting(client, await measureOk(client, 'p'), 'GET /ok responded 200')
 
     const out = await call(client, 'facts.recall.query', { project: 'p' })
     const claim = (out.envelope['data'] as { claims: Record<string, unknown>[] }).claims[0]!
@@ -376,13 +367,11 @@ describe('recall never measures', () => {
       url: `${fx.origin}/echo-auth`,
       headers: { authorization: 'Bearer a-very-secret-token-here' },
     })
-    const obs = measured.envelope['observation_id'] as string
-    await call(client, 'facts.recall.assert', {
-      project: 'p',
-      statement: 'the authenticated route answered',
-      evidence: [{ type: 'observation', observation_id: obs }],
-      observed_by: 'test-agent',
-    })
+    await assertCiting(
+      client,
+      measured.envelope['observation_id'] as string,
+      'the authenticated route answered',
+    )
 
     const out = await call(client, 'facts.recall.query', { project: 'p' })
     const claim = (out.envelope['data'] as { claims: Record<string, unknown>[] }).claims[0]!

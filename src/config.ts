@@ -1,5 +1,5 @@
 import type { NetPolicy, NetProfile } from './policy/net.js'
-import { Err, Ok, toolError, type Result } from './kernel/result.js'
+import { Err, ErrorCodes, Ok, toolError, type Result } from './kernel/result.js'
 import { DEFAULT_MAX_REDIRECTS } from './tools/measure-http.js'
 import { DEFAULT_STALE_SECONDS } from './tools/recall.js'
 
@@ -19,7 +19,7 @@ export interface Config {
   readonly defaultStaleSeconds: number
 }
 
-export const CONFIG_INVALID = 'CONFIG_INVALID'
+export const CONFIG_INVALID = ErrorCodes.CONFIG_INVALID
 
 const PROFILES: readonly NetProfile[] = ['deny-all', 'loopback', 'private', 'allowlist']
 

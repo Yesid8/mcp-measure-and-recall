@@ -23,7 +23,7 @@ import { buildEnvelope, WarningCodes, type Envelope, type Warning } from '../ker
 import { toIsoWithOffset, type Clock } from '../kernel/clock.js'
 import { IdPrefix, newId } from '../kernel/ulid.js'
 import { normalizeProject } from '../kernel/project.js'
-import { CoreErrors, toolError, type Result, type ToolError } from '../kernel/result.js'
+import { ErrorCodes, Ok, toolError, type Result, type ToolError } from '../kernel/result.js'
 import type { AnyTool, ToolContext } from '../kernel/tool.js'
 
 export interface ServerInfo {
@@ -112,12 +112,12 @@ const CLIENT_CANCELLED = new Error('cancelled by client')
  * and is recorded, because "nothing answers on that port" is a citable fact.
  */
 const NOT_AN_OBSERVATION: ReadonlySet<string> = new Set([
-  CoreErrors.INVALID_INPUT,
-  CoreErrors.INVALID_PROJECT,
-  CoreErrors.HOST_NOT_ALLOWED,
-  CoreErrors.PATH_NOT_ALLOWED,
-  CoreErrors.CANCELLED,
-  'URL_INVALID',
+  ErrorCodes.INVALID_INPUT,
+  ErrorCodes.INVALID_PROJECT,
+  ErrorCodes.HOST_NOT_ALLOWED,
+  ErrorCodes.PATH_NOT_ALLOWED,
+  ErrorCodes.CANCELLED,
+  ErrorCodes.URL_INVALID,
 ])
 
 /**
@@ -450,109 +450,158 @@ export class ProtocolServer {
     return null
   }
 
+  /**
+   * One tools/call, in the order a call can fail: the request itself (a
+   * JSON-RPC error), the arguments (a tool error the model can correct), the
+   * run (a tool error, or nothing at all if the client cancelled), and the
+   * recording of what was observed (a warning, never a failure).
+   */
   async #call(req: JsonRpcRequest, legacy: boolean): Promise<JsonRpcResponse | null> {
-    const id = req.id
-    const name = req.params?.['name']
-    if (typeof name !== 'string') {
-      return failure(
-        id,
-        INVALID_PARAMS,
-        'tools/call requires a string params.name',
-        this.#errorTime(),
+    const resolved = this.#resolveCall(req)
+    if ('response' in resolved) return resolved.response
+    const { tool, name, args } = resolved
+
+    // What every envelope from this call shares, whichever path it takes.
+    const base = {
+      tool: name,
+      requestId: newId(IdPrefix.request),
+      startedMonotonic: this.#opts.clock.monotonic(),
+      startedAt: this.#opts.clock.now(),
+      clock: this.#opts.clock,
+    }
+    const respond = (envelope: Envelope<unknown>): JsonRpcResponse =>
+      success(req.id, this.#toolResult(envelope, envelope.error !== null, legacy))
+
+    const prepared = this.#prepareInput(tool, args)
+    if (!prepared.ok) {
+      const { project, target, error } = prepared.error
+      return respond(
+        buildEnvelope({ ...base, ...projectField(project), target, data: null, error }),
       )
     }
-    const tool = this.#tools.get(name)
-    if (tool === undefined) {
-      return failure(id, INVALID_PARAMS, `unknown tool: ${name}`, this.#errorTime())
+    const { input, project, target } = prepared.value
+
+    const meta = (req.params?.['_meta'] ?? {}) as Record<string, unknown>
+    const outcome = await this.#run(tool, input, project, req.id, {
+      tool: name,
+      requestId: base.requestId,
+      // Self-declared and unverified: logged for diagnosis, never used to decide.
+      client: meta[MetaKeys.clientInfo],
+    })
+    if (outcome.kind === 'threw') {
+      // Throwing is a bug. It goes out as -32603 with no detail to the client.
+      return failure(req.id, INTERNAL_ERROR, 'internal error', this.#errorTime())
     }
+    if (outcome.kind === 'cancelled') return null
+
+    const envelope = buildEnvelope({
+      ...base,
+      ...projectField(project),
+      target,
+      data: outcome.data,
+      error: outcome.error,
+      warnings: outcome.warnings,
+    })
+    return respond(tool.records === true ? await this.#withRecording(envelope) : envelope)
+  }
+
+  /** The tool and its arguments, or the JSON-RPC error a malformed request gets. */
+  #resolveCall(
+    req: JsonRpcRequest,
+  ):
+    { tool: AnyTool; name: string; args: Record<string, unknown> } | { response: JsonRpcResponse } {
+    const reject = (message: string) => ({
+      response: failure(req.id, INVALID_PARAMS, message, this.#errorTime()),
+    })
+    const name = req.params?.['name']
+    if (typeof name !== 'string') return reject('tools/call requires a string params.name')
+    const tool = this.#tools.get(name)
+    if (tool === undefined) return reject(`unknown tool: ${name}`)
 
     const args: unknown = req.params?.['arguments'] ?? {}
     // CallToolRequest types arguments as an object; anything else breaks the
     // request itself, before any tool schema is involved.
     if (args === null || typeof args !== 'object' || Array.isArray(args)) {
-      return failure(
-        id,
-        INVALID_PARAMS,
-        'tools/call arguments must be an object',
-        this.#errorTime(),
-      )
+      return reject('tools/call arguments must be an object')
     }
-    const rawArgs = args as Record<string, unknown>
-    const meta = (req.params?.['_meta'] ?? {}) as Record<string, unknown>
-    // Self-declared and unverified: logged for diagnosis, never used to decide.
-    const clientInfo = meta[MetaKeys.clientInfo]
+    return { tool, name, args: args as Record<string, unknown> }
+  }
 
-    const startedAt = this.#opts.clock.now()
-    const startedMonotonic = this.#opts.clock.monotonic()
-    const requestId = newId(IdPrefix.request)
-
-    // What every envelope from this call shares, whichever path it takes.
-    const base = { tool: name, requestId, startedMonotonic, startedAt, clock: this.#opts.clock }
-    const asToolError = (
-      project: string | undefined,
-      target: Readonly<Record<string, unknown>>,
-      error: ToolError,
-    ): JsonRpcResponse =>
-      success(
-        id,
-        this.#toolResult(
-          buildEnvelope({
-            ...base,
-            ...(project !== undefined ? { project } : {}),
-            target,
-            data: null,
-            error,
-          }),
-          true,
-          legacy,
-        ),
-      )
-
-    // Invalid arguments are a TOOL error, not a JSON-RPC error: the model can
-    // read the zod detail and correct itself on the next call.
+  /**
+   * Validates the arguments against the tool's schema and normalizes the
+   * project. A failure here is a TOOL error, not a JSON-RPC one: the model can
+   * read the detail and correct itself on the next call.
+   */
+  #prepareInput(
+    tool: AnyTool,
+    args: Record<string, unknown>,
+  ): Result<
+    { input: Record<string, unknown>; project: string | undefined; target: Target },
+    { project: string | undefined; target: Target; error: ToolError }
+  > {
     const parsed = tool.input.safeParse(args)
     if (!parsed.success) {
-      const rawProject = typeof rawArgs['project'] === 'string' ? rawArgs['project'] : ''
-      return asToolError(
-        this.#requireProject ? rawProject : undefined,
-        rawArgs,
-        toolError(CoreErrors.INVALID_INPUT, 'arguments do not match the tool schema', {
-          detail: {
-            issues: parsed.error.issues.map((issue) => ({
-              path: issue.path.join('.'),
-              code: issue.code,
-              message: issue.message,
-            })),
-          },
-        }),
-      )
-    }
-
-    let input = parsed.data as Record<string, unknown>
-    let project: string | undefined
-    if (this.#requireProject) {
-      const projectRaw = typeof input['project'] === 'string' ? input['project'] : ''
-      const normalized = normalizeProject(projectRaw)
-      if (!normalized.ok) {
-        return asToolError(projectRaw, tool.target(parsed.data as never), normalized.error)
+      const raw = typeof args['project'] === 'string' ? args['project'] : ''
+      return {
+        ok: false,
+        error: {
+          project: this.#requireProject ? raw : undefined,
+          target: args,
+          error: toolError(ErrorCodes.INVALID_INPUT, 'arguments do not match the tool schema', {
+            detail: {
+              issues: parsed.error.issues.map((issue) => ({
+                path: issue.path.join('.'),
+                code: issue.code,
+                message: issue.message,
+              })),
+            },
+          }),
+        },
       }
-      project = normalized.value
-      // The handler sees the normalized form, the same one the envelope reports.
-      input = { ...input, project }
     }
 
+    const target = tool.target(parsed.data)
+    const input = parsed.data as Record<string, unknown>
+    if (!this.#requireProject) return Ok({ input, project: undefined, target })
+
+    const raw = typeof input['project'] === 'string' ? input['project'] : ''
+    const normalized = normalizeProject(raw)
+    if (!normalized.ok) {
+      return { ok: false, error: { project: raw, target, error: normalized.error } }
+    }
+    // The handler sees the normalized form, the same one the envelope reports.
+    const project = normalized.value
+    return Ok({ input: { ...input, project }, project, target })
+  }
+
+  /**
+   * Runs the handler under the call's deadline and the client's cancellation.
+   *
+   * The deadline and a cancellation abort the same signal; which one fired is
+   * remembered so the outcome says TIMEOUT or CANCELLED as appropriate, and a
+   * client's cancellation gets no answer at all.
+   */
+  async #run(
+    tool: AnyTool,
+    input: Record<string, unknown>,
+    project: string | undefined,
+    id: RequestId,
+    logFields: Record<string, unknown>,
+  ): Promise<
+    | { kind: 'done'; data: unknown; error: ToolError | null; warnings: Warning[] }
+    | { kind: 'threw' }
+    | { kind: 'cancelled' }
+  > {
     const timeoutMs = tool.timeoutMs ?? this.#opts.defaultTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS
     const controller = new AbortController()
     this.#inFlight.set(id, controller)
-    // Remembered so the outcome can say TIMEOUT rather than CANCELLED: the two
-    // abort the same signal, but only one of them was the client's doing.
     let deadlineHit = false
     const timer = setTimeout(() => {
       deadlineHit = true
       controller.abort(new Error('deadline exceeded'))
     }, timeoutMs)
-    const warnings: Warning[] = []
 
+    const warnings: Warning[] = []
     const ctx: ToolContext = {
       signal: controller.signal,
       clock: this.#opts.clock,
@@ -560,77 +609,62 @@ export class ProtocolServer {
       warn: (w) => warnings.push(w),
     }
 
-    let data: unknown = null
-    let error: ToolError | null = null
+    let out: Result<unknown>
     try {
-      const running = tool.handler(input as never, ctx)
+      const running = tool.handler(input, ctx) as Promise<Result<unknown>>
       // Once abandoned below, its eventual rejection has nobody to reach.
       running.catch(() => {})
-      const out = await Promise.race([running, abandonAfterAbort(controller.signal)])
-      if (out.ok) data = out.value
-      else error = out.error
+      out = await Promise.race([running, abandonAfterAbort(controller.signal)])
     } catch (e) {
-      // Throwing is a bug. It goes out as -32603 with no detail to the client.
       this.#opts.log('error', 'handler threw', {
-        tool: name,
-        requestId,
-        client: clientInfo,
+        ...logFields,
         error: e instanceof Error ? e.stack : String(e),
       })
-      return failure(id, INTERNAL_ERROR, 'internal error', this.#errorTime())
+      return { kind: 'threw' }
     } finally {
       clearTimeout(timer)
       this.#inFlight.delete(id)
     }
 
-    if (controller.signal.reason === CLIENT_CANCELLED) return null
+    if (controller.signal.reason === CLIENT_CANCELLED) return { kind: 'cancelled' }
 
-    if (deadlineHit && (error === null || error.code === CoreErrors.CANCELLED)) {
+    let error = out.ok ? null : out.error
+    if (deadlineHit && (error === null || error.code === ErrorCodes.CANCELLED)) {
       // Either the handler returned just as the deadline fired — a success whose
       // duration exceeds the declared timeout — or it reported the abort as a
       // cancellation. Both are the deadline, and the caller should read it so.
-      error = toolError(CoreErrors.TIMEOUT, `the call exceeded its ${timeoutMs} ms deadline`)
+      error = toolError(ErrorCodes.TIMEOUT, `the call exceeded its ${timeoutMs} ms deadline`)
     } else if (error === null && controller.signal.aborted) {
-      error = toolError(CoreErrors.CANCELLED, 'the call was cancelled before completing')
+      error = toolError(ErrorCodes.CANCELLED, 'the call was cancelled before completing')
     }
+    return { kind: 'done', data: out.ok && error === null ? out.value : null, error, warnings }
+  }
 
-    let envelope = buildEnvelope({
-      ...base,
-      ...(project !== undefined ? { project } : {}),
-      target: tool.target(parsed.data as never),
-      data,
-      error,
-      warnings,
-    })
+  /**
+   * Hands an observation to recordObservation, if there is one. Failed
+   * observations are recorded too — a refused connection is as much a fact as
+   * a 200 — but a refusal by the server itself observed nothing.
+   */
+  async #withRecording(envelope: Envelope<unknown>): Promise<Envelope<unknown>> {
+    if (this.#opts.recordObservation === undefined) return envelope
+    if (envelope.error !== null && NOT_AN_OBSERVATION.has(envelope.error.code)) return envelope
 
-    // Observations become citable evidence, failed ones included: a refused
-    // connection is as much a fact as a 200. A refusal by the server itself
-    // observed nothing.
-    if (
-      this.#opts.recordObservation !== undefined &&
-      tool.records === true &&
-      (error === null || !NOT_AN_OBSERVATION.has(error.code))
-    ) {
-      const recorded = await this.#recordSafely(envelope)
-      if (!recorded.ok) {
-        // The measurement itself stands; what the caller must learn is that its
-        // observation_id will not resolve in recall.assert. Silence here would
-        // surface later as OBSERVATION_NOT_FOUND with no trail back to the cause.
-        envelope = {
-          ...envelope,
-          warnings: [
-            ...envelope.warnings,
-            {
-              code: WarningCodes.OBSERVATION_NOT_RECORDED,
-              message: 'the observation could not be stored and cannot be cited as evidence',
-              detail: { reason: recorded.error.code },
-            },
-          ],
-        }
-      }
+    const recorded = await this.#recordSafely(envelope)
+    if (recorded.ok) return envelope
+    // The measurement itself stands; what the caller must learn is that its
+    // observation_id will not resolve in recall.assert. Silence here would
+    // surface later as OBSERVATION_NOT_FOUND with no trail back to the cause.
+    return {
+      ...envelope,
+      warnings: [
+        ...envelope.warnings,
+        {
+          code: WarningCodes.OBSERVATION_NOT_RECORDED,
+          message: 'the observation could not be stored and cannot be cited as evidence',
+          detail: { reason: recorded.error.code },
+        },
+      ],
     }
-
-    return success(id, this.#toolResult(envelope, error !== null, legacy))
   }
 
   /** Persisting must never fail the measurement the caller already holds. */
@@ -649,7 +683,7 @@ export class ProtocolServer {
         observation_id: envelope.observation_id,
         error: e instanceof Error ? e.stack : String(e),
       })
-      return { ok: false, error: toolError(CoreErrors.STORAGE_ERROR, 'recording threw') }
+      return { ok: false, error: toolError(ErrorCodes.STORAGE_ERROR, 'recording threw') }
     }
   }
 
@@ -675,6 +709,14 @@ export class ProtocolServer {
   }
 }
 
+/** The effective arguments of a call, as the envelope reports them. */
+type Target = Readonly<Record<string, unknown>>
+
+/** The envelope's `project` field: present only when the server requires one. */
+function projectField(project: string | undefined): { project?: string } {
+  return project !== undefined ? { project } : {}
+}
+
 /** Whether a request carries the 2026-07-28 per-request envelope. */
 function carriesProtocolVersion(req: JsonRpcRequest): boolean {
   const meta = req.params?.['_meta']
@@ -697,7 +739,7 @@ function abandonAfterAbort(signal: AbortSignal): Promise<Result<never>> {
         () =>
           resolve({
             ok: false,
-            error: toolError(CoreErrors.CANCELLED, 'the tool did not stop when its signal aborted'),
+            error: toolError(ErrorCodes.CANCELLED, 'the tool did not stop when its signal aborted'),
           }),
         ABORT_GRACE_MS,
       ).unref()

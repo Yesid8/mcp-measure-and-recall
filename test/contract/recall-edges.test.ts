@@ -180,6 +180,20 @@ describe('pagination', () => {
     expect(second.next_cursor).toBeNull()
   })
 
+  it('keeps a claim retracted between pages as it stood at the first one', async () => {
+    const ids: string[] = []
+    for (const s of ['a', 'b', 'c']) ids.push(await claim(s))
+    const first = await page({ limit: 2 })
+
+    await call('facts.recall.retract', { project: 'p', claim_id: ids[2], reason: 'r', by: 'b' })
+    const second = await page({ limit: 2, cursor: first.next_cursor })
+    expect(second.claims.map((c) => c.statement)).toEqual(['c'])
+
+    // A new query, without the cursor, sees the registry as it is now.
+    const fresh = await page({ limit: 10 })
+    expect(fresh.claims.map((c) => c.statement)).toEqual(['a', 'b'])
+  })
+
   it('refuses a cursor replayed under different filters', async () => {
     for (const s of ['a', 'b']) await claim(s)
     const first = await page({ limit: 1 })

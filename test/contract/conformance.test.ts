@@ -16,6 +16,7 @@ import {
 } from '../../src/tools/recall.js'
 import { StoreRegistry } from '../../src/store/store.js'
 import { SystemClock } from '../../src/kernel/clock.js'
+import { ErrorCodes } from '../../src/kernel/result.js'
 import type { NetPolicy } from '../../src/policy/net.js'
 
 /**
@@ -123,6 +124,29 @@ describe('#41 the source knows no particular application', () => {
     const sources = files('src')
     expect(sources.length).toBeGreaterThan(10)
     expect(sources.filter((f) => DOMAIN.test(readFileSync(f, 'utf8')))).toEqual([])
+  })
+})
+
+describe('error codes come from one table', () => {
+  const sources = (dir: string): string[] =>
+    readdirSync(dir).flatMap((name) => {
+      const full = join(dir, name)
+      return statSync(full).isDirectory() ? sources(full) : full.endsWith('.ts') ? [full] : []
+    })
+  const code = sources('src')
+    .filter((f) => !f.endsWith(join('kernel', 'result.ts')))
+    .map((f) => readFileSync(f, 'utf8'))
+    .join('\n')
+
+  it('raises no code written by hand', () => {
+    expect(code).not.toMatch(/toolError\(\s*['"`]/)
+  })
+
+  it('lists no code that nothing raises', () => {
+    const unused = Object.keys(ErrorCodes).filter(
+      (k) => !new RegExp(`ErrorCodes\\.${k}\\b|CoreErrors\\.${k}\\b`).test(code),
+    )
+    expect(unused).toEqual([])
   })
 })
 

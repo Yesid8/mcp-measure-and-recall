@@ -1,4 +1,4 @@
-import { Err, Ok, type Result, toolError, CoreErrors } from './result.js'
+import { ErrorCodes, Err, Ok, type Result, toolError } from './result.js'
 
 /**
  * A project is a free string, normalized. It is created on first use.
@@ -36,7 +36,7 @@ export function normalizeProject(raw: string): Result<string> {
 
   if (collapsed.length === 0) {
     return Err(
-      toolError(CoreErrors.INVALID_PROJECT, 'project is empty after normalization', {
+      toolError(ErrorCodes.INVALID_PROJECT, 'project is empty after normalization', {
         detail: { received: raw },
       }),
     )
@@ -44,7 +44,7 @@ export function normalizeProject(raw: string): Result<string> {
   if (collapsed.length > MAX_LEN) {
     return Err(
       toolError(
-        CoreErrors.INVALID_PROJECT,
+        ErrorCodes.INVALID_PROJECT,
         `project is ${collapsed.length} characters after normalization, maximum is ${MAX_LEN}`,
         { detail: { received: raw, normalized: collapsed } },
       ),
@@ -63,7 +63,7 @@ export function normalizeTag(raw: string): Result<string> {
   if (normalized.ok) return normalized
   return Err(
     toolError(
-      CoreErrors.INVALID_INPUT,
+      ErrorCodes.INVALID_INPUT,
       `tag ${JSON.stringify(raw)}: ${normalized.error.message.replace(/^project /, '')}`,
       { detail: { tag: raw } },
     ),

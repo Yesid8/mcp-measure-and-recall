@@ -128,12 +128,10 @@ export class ProjectStore {
   }
 
   /**
-   * Resolves several observations in a single pass over the log.
-   *
-   * A claim commonly cites more than one, and resolving them one at a time
-   * re-reads the whole file per citation. The last event per id wins: an id is
-   * written once today, and reducing to the latest keeps this correct if a
-   * stream ever records more than one.
+   * Resolves the observations a claim cites, each read straight from its line
+   * through the log's key index rather than by scanning every measurement ever
+   * taken. The last event per id wins: an id is written once today, and
+   * reducing to the latest keeps this correct if a stream ever records more.
    */
   async findObservations(ids: Iterable<string>): Promise<{
     found: Map<string, StoredObservation>

@@ -17,7 +17,7 @@
 | **A5** — Rodaje con un consumidor real | **aplazada** (la hará el primer consumidor, desde su proyecto) | Ver §4 |
 | **A6** — Documento de traspaso | **completa** | [USO.md](USO.md) |
 
-**472 tests en verde**, unitarios y de contrato. Al cierre de A4 eran 160; el resto los
+**483 tests en verde**, unitarios y de contrato. Al cierre de A4 eran 160; el resto los
 añadieron las revisiones de código posteriores, que cubrieron rutas de error, bordes de
 protocolo y fallos propios de Windows. `typecheck`, `lint`, `format:check` y `test` limpios,
 sin errores sueltos en ejecuciones repetidas, y la CI los repite en Linux y Windows.
@@ -210,7 +210,7 @@ Está especificado y pospuesto a propósito. Entra cuando el uso lo pida, no ant
 | `recall.supersede` (atómico) | [05 §6.3](v2/05-modulo-facts.md) | Una secuencia a medias haga daño real |
 | `recall.export` | [05 §6.6](v2/05-modulo-facts.md) | Haga falta sacar el registro |
 | Navegador (Playwright) | [05 §4.3](v2/05-modulo-facts.md) | Haya que abrir un panel y mirarlo |
-| Índice y *group commit* | [04 §2.2, §3](v2/04-almacenamiento.md) | Una consulta real sea lenta. **Medir antes** |
+| *Group commit* | [04 §2.2](v2/04-almacenamiento.md) | Una escritura real sea lenta. **Medir antes**: hoy un `recall.assert` cuesta ~2 ms con `fsync` |
 | Rotación, GC, blobs | [04 §2.4, §4](v2/04-almacenamiento.md) | El almacén crezca de verdad |
 | Transporte HTTP y autorización | [03 §7](v2/03-protocolo.md) | Etapa D |
 | Monorepo y extracción del núcleo | [01](v2/01-arquitectura.md), [02](v2/02-nucleo-api.md) | Etapa D, tras un segundo dominio |
@@ -277,6 +277,7 @@ especificación v1 y los ADR. Lo que encontraron, y qué se hizo con cada cosa.
 
 | Documento | Dice | El código hace, y por qué |
 |---|---|---|
+| 04 §3 | Índice persistido en `claims.idx` con *checkpoint* | Vistas en memoria, construidas en una pasada y alimentadas con cada escritura: un índice clave → posición, y una proyección de las afirmaciones sin su evidencia. Nada nuevo en disco que pueda desincronizarse; el `LOCK` garantiza un solo escritor y un cambio de tamaño ajeno provoca reconstrucción. Medido: `recall.query` con 5 000 afirmaciones pasó de 1 690 ms a 33 ms |
 | 03 §1, §8.4 | Solo `2026-07-28`; `initialize` se rechaza | Ambas eras por conexión, `initialize` incluido: Claude Code no conectaba ([ADR-0004](adr/0004-hablar-tambien-la-era-de-sesion.md)) |
 | 05 §4.1 | `body_format: json\|text\|base64\|blob` | `none` en lugar de `blob`: no hay almacén de blobs (pospuesto) y un cuerpo vacío necesita nombre |
 | 05 §6.4 | `ref` con `{tool, http_status}` | `{tool, observed_at}`: vale para toda tool, no solo HTTP |

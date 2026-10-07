@@ -2,13 +2,14 @@ import { z } from 'zod'
 import { createHash, randomBytes } from 'node:crypto'
 import { connect as netConnect, type Socket } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
-import { defineTool } from '../kernel/tool.js'
-import { CoreErrors, Err, Ok, toolError, type Result } from '../kernel/result.js'
+import { defineTool, type ToolContext } from '../kernel/tool.js'
+import { ErrorCodes, Err, Ok, toolError, type Result } from '../kernel/result.js'
 import { WarningCodes } from '../kernel/envelope.js'
 import { toIsoWithOffset } from '../kernel/clock.js'
 import {
   WS_SCHEMES,
   resolveAndValidate,
+  tlsPeer,
   type NetPolicy,
   type ResolvedTarget,
 } from '../policy/net.js'
@@ -236,13 +237,13 @@ function parseUpgradeResponse(
   const statusLine = head.split('\r\n')[0] ?? ''
   if (!statusLine.includes('101')) {
     return Err(
-      toolError('WS_HANDSHAKE_FAILED', `the upgrade was refused: ${statusLine}`, {
+      toolError(ErrorCodes.WS_HANDSHAKE_FAILED, `the upgrade was refused: ${statusLine}`, {
         detail: { status_line: statusLine },
       }),
     )
   }
   if (/sec-websocket-accept:\s*(\S+)/i.exec(head)?.[1] !== expectedAccept) {
-    return Err(toolError('WS_HANDSHAKE_FAILED', 'Sec-WebSocket-Accept did not match'))
+    return Err(toolError(ErrorCodes.WS_HANDSHAKE_FAILED, 'Sec-WebSocket-Accept did not match'))
   }
   return Ok({
     negotiatedSubprotocol: /sec-websocket-protocol:\s*(\S+)/i.exec(head)?.[1] ?? null,
@@ -336,270 +337,294 @@ export function createMeasureWs(policy: NetPolicy) {
     handler: async (i, ctx): Promise<Result<MeasureWsData>> => {
       const validated = await resolveAndValidate(i.url, policy, ctx.signal, WS_SCHEMES)
       if (!validated.ok) return Err(validated.error)
-      const target = validated.value
-
-      const started = ctx.clock.monotonic()
-      const key = randomBytes(16).toString('base64')
-      const expectedAccept = createHash('sha1')
-        .update(key + GUID)
-        .digest('base64')
-
-      const isTls = target.url.protocol === 'wss:'
-      const socket: Socket = isTls
-        ? tlsConnect({
-            host: target.address,
-            port: target.port,
-            servername: target.hostname,
-            rejectUnauthorized: true,
-          })
-        : netConnect({ host: target.address, port: target.port })
-
-      const messages: Array<MeasureWsData['messages'][number]> = []
-      const assembler = new MessageAssembler()
-      let protocolFault = false
-      let inboundCount = 0
-      let inboundBytes = 0
-      let truncated = false
-      let seq = 0
-      let openedAt: Date | null = null
-      let openedMonotonic = 0
-      let handshakeMs: number | null = null
-      let negotiated: string | null = null
-      let closed: MeasureWsData['closed'] = null
-
-      const finish = (by: 'server' | 'client' | 'timeout', code: number | null, reason: string) => {
-        if (closed === null) {
-          closed = { at: toIsoWithOffset(ctx.clock.now()), code, reason, by }
-        }
-      }
-
-      const result = await new Promise<Result<void>>((resolve) => {
-        // Every timer this call schedules, so done() can clear them directly
-        // instead of relying on socket.destroy() emitting 'close' for each.
-        const timers = new Set<NodeJS.Timeout>()
-        const schedule = (fn: () => void, ms: number): NodeJS.Timeout => {
-          const t = setTimeout(() => {
-            timers.delete(t)
-            fn()
-          }, ms)
-          timers.add(t)
-          return t
-        }
-
-        let settled = false
-        const done = (r: Result<void>) => {
-          if (settled) return
-          settled = true
-          for (const t of timers) clearTimeout(t)
-          timers.clear()
-          ctx.signal.removeEventListener('abort', onAbort)
-          socket.destroy()
-          resolve(r)
-        }
-
-        // Covers the case where the socket never opens at all. The listen
-        // window itself is scheduled on open; this only bounds the time spent
-        // before that — DNS, TCP, TLS and the upgrade — so the call cannot hang
-        // on a peer that accepts a connection and then says nothing.
-        const connectTimer = schedule(
-          () => {
-            finish('timeout', null, '')
-            done(Ok(undefined))
-          },
-          i.listen_seconds * 1000 + CONNECT_BUDGET_MS,
-        )
-
-        const onAbort = () => {
-          finish('client', null, 'cancelled')
-          done(Err(toolError(CoreErrors.CANCELLED, 'the call was cancelled')))
-        }
-        ctx.signal.addEventListener('abort', onAbort, { once: true })
-        // addEventListener does not fire for a signal that is already aborted,
-        // which would leave the socket open until the outer bound expires.
-        if (ctx.signal.aborted) onAbort()
-
-        // `on`, not `once`: an 'error' with no listener crashes the whole
-        // process, and a socket can emit a second one after the first. done()
-        // is idempotent, so later errors are simply absorbed.
-        socket.on('error', (e: NodeJS.ErrnoException) => {
-          // Shared with measure.http: error codes are public contract, so the
-          // same socket failure must not surface under two different names.
-          done(Err(mapSocketError(e)))
-        })
-
-        socket.once('connect', () => {
-          socket.write(buildUpgradeRequest(target, key, i))
-        })
-
-        let handshakeDone = false
-        let buffer: Buffer = Buffer.alloc(0)
-
-        socket.on('data', (chunk: Buffer) => {
-          // An empty remainder is the common case once frames are being
-          // consumed; taking the chunk as-is avoids a copy per event.
-          buffer = buffer.length === 0 ? chunk : Buffer.concat([buffer, chunk])
-
-          if (!handshakeDone) {
-            const sep = buffer.indexOf('\r\n\r\n')
-            if (sep === -1) return
-            const head = buffer.subarray(0, sep).toString('utf8')
-            buffer = buffer.subarray(sep + 4)
-
-            const upgrade = parseUpgradeResponse(head, expectedAccept)
-            if (!upgrade.ok) {
-              done(Err(upgrade.error))
-              return
-            }
-            negotiated = upgrade.value.negotiatedSubprotocol
-
-            handshakeDone = true
-            openedAt = ctx.clock.now()
-            openedMonotonic = ctx.clock.monotonic()
-            handshakeMs = openedMonotonic - started
-
-            // The listen window starts at the open, and always runs its full length.
-            clearTimeout(connectTimer)
-            timers.delete(connectTimer)
-            schedule(() => {
-              finish('timeout', null, '')
-              done(Ok(undefined))
-            }, i.listen_seconds * 1000)
-
-            for (const msg of i.send) {
-              const text =
-                typeof msg.payload === 'string' ? msg.payload : JSON.stringify(msg.payload)
-              const buf = Buffer.from(text, 'utf8')
-              const write = () => {
-                if (settled) return
-                socket.write(encodeFrame(OP_TEXT, buf))
-                const decoded = decodePayload(buf, true)
-                messages.push({
-                  seq: ++seq,
-                  at: toIsoWithOffset(ctx.clock.now()),
-                  offset_ms: ctx.clock.monotonic() - openedMonotonic,
-                  direction: 'out',
-                  type: 'text',
-                  bytes: buf.length,
-                  payload: decoded.payload,
-                  payload_format: decoded.format,
-                })
-              }
-              if (msg.delay_ms === 0) write()
-              else schedule(write, msg.delay_ms)
-            }
-          }
-
-          const { frames, rest, malformed } = decodeFrames(buffer)
-          buffer = rest
-          if (malformed) {
-            protocolFault = true
-            finish('client', 1002, 'protocol error')
-            done(Ok(undefined))
-            return
-          }
-
-          for (const frame of frames) {
-            if (frame.opcode === OP_CLOSE) {
-              const code = frame.payload.length >= 2 ? frame.payload.readUInt16BE(0) : null
-              finish('server', code, frame.payload.subarray(2).toString('utf8'))
-              done(Ok(undefined))
-              return
-            }
-            // Control frames are never fragmented and never become messages.
-            if (frame.opcode === OP_PING) {
-              socket.write(encodeFrame(OP_PONG, frame.payload))
-              continue
-            }
-            if (frame.opcode === OP_PONG) continue
-
-            const message = assembler.accept(frame)
-            if (message === null) continue
-
-            // The caps bound what was RECEIVED — that is the observation. The
-            // caller's own `send` messages are few and deliberate, so counting
-            // them here would let the client shrink its own inbound budget.
-            if (inboundCount >= i.max_messages || inboundBytes >= i.max_total_bytes) {
-              // Stop accumulating, but keep listening: the caller asked for a
-              // window of time, and cutting it short would misreport the window.
-              truncated = true
-              continue
-            }
-
-            // Byte cap by design; the last multibyte character may be split,
-            // which decodePayload will surface as replacement text or non-JSON.
-            const capped = message.payload.subarray(0, i.max_message_bytes)
-            if (capped.length < message.payload.length) truncated = true
-            inboundCount += 1
-            inboundBytes += capped.length
-
-            const isText = message.opcode === OP_TEXT
-            const decoded = decodePayload(capped, isText)
-            messages.push({
-              seq: ++seq,
-              at: toIsoWithOffset(ctx.clock.now()),
-              offset_ms: ctx.clock.monotonic() - openedMonotonic,
-              direction: 'in',
-              type: isText ? 'text' : 'binary',
-              bytes: capped.length,
-              payload: decoded.payload,
-              payload_format: decoded.format,
-            })
-          }
-        })
-
-        socket.once('close', () => {
-          if (handshakeDone) {
-            finish('server', null, '')
-            done(Ok(undefined))
-          }
-        })
-      })
-
-      if (!result.ok) return Err(result.error)
-
-      if (protocolFault) {
-        // The listen ended early on a frame we cannot interpret. Saying so is
-        // the honest report: the window was cut short and the caller must not
-        // read the message list as "everything that arrived in N seconds".
-        ctx.warn({
-          code: WarningCodes.WS_PROTOCOL_ERROR,
-          message: 'the peer sent a frame this client cannot interpret; the listen ended early',
-        })
-      }
-      if (assembler.pending) {
-        ctx.warn({
-          code: WarningCodes.WS_MESSAGE_INCOMPLETE,
-          message:
-            'the listen ended while a fragmented message was still arriving; it is not reported',
-        })
-      }
-      if (truncated) {
-        ctx.warn({
-          code: WarningCodes.MESSAGES_TRUNCATED,
-          message: 'message accumulation hit a cap; listening continued for the full window',
-          detail: {
-            max_messages: i.max_messages,
-            max_message_bytes: i.max_message_bytes,
-            max_total_bytes: i.max_total_bytes,
-          },
-        })
-      }
-
-      return Ok({
-        kind: 'ws' as const,
-        connected: openedAt !== null,
-        opened_at: openedAt === null ? null : toIsoWithOffset(openedAt),
-        handshake_ms: handshakeMs,
-        negotiated_subprotocol: negotiated,
-        closed,
-        listen_seconds_requested: i.listen_seconds,
-        listen_seconds_actual:
-          openedAt === null ? 0 : (ctx.clock.monotonic() - openedMonotonic) / 1000,
-        messages,
-        message_count: messages.length,
-        messages_truncated: truncated,
-        bytes_total: inboundBytes,
-      })
+      const listen = new WsListen(validated.value, i, ctx)
+      const ended = await listen.run()
+      if (!ended.ok) return Err(ended.error)
+      listen.reportWarnings()
+      return Ok(listen.observation())
     },
   })
+}
+
+type Message = MeasureWsData['messages'][number]
+
+/**
+ * One listen: connect, upgrade, hear frames for the window, then report.
+ *
+ * Its state is everything the observation is made of. Each socket event has a
+ * method of its own, and every way the listen can end goes through end(),
+ * which is idempotent: a socket can emit several of them, and only the first
+ * says how the connection ended.
+ */
+class WsListen {
+  readonly #target: ResolvedTarget
+  readonly #i: MeasureWsInput
+  readonly #ctx: ToolContext
+  readonly #key = randomBytes(16).toString('base64')
+  readonly #started: number
+
+  #socket: Socket | null = null
+  readonly #assembler = new MessageAssembler()
+  readonly #messages: Message[] = []
+  /** Every timer scheduled, so end() clears them all without waiting for 'close'. */
+  readonly #timers = new Set<NodeJS.Timeout>()
+  #buffer: Buffer = Buffer.alloc(0)
+  #seq = 0
+  #inboundCount = 0
+  #inboundBytes = 0
+  #truncated = false
+  #protocolFault = false
+  #openedAt: Date | null = null
+  #openedMonotonic = 0
+  #handshakeMs: number | null = null
+  #negotiated: string | null = null
+  #closed: MeasureWsData['closed'] = null
+  #settle: ((r: Result<void>) => void) | null = null
+
+  constructor(target: ResolvedTarget, i: MeasureWsInput, ctx: ToolContext) {
+    this.#target = target
+    this.#i = i
+    this.#ctx = ctx
+    this.#started = ctx.clock.monotonic()
+  }
+
+  /** Resolves when the listen ends: the window elapsed, the peer closed, or it failed. */
+  run(): Promise<Result<void>> {
+    return new Promise((resolve) => {
+      this.#settle = resolve
+      const { address, port, url } = this.#target
+      const socket: Socket =
+        url.protocol === 'wss:'
+          ? tlsConnect({ host: address, port, ...tlsPeer(this.#target) })
+          : netConnect({ host: address, port })
+      this.#socket = socket
+
+      // Bounds what happens before the window opens — DNS, TCP, TLS and the
+      // upgrade — so the call cannot hang on a peer that accepts a connection
+      // and then says nothing. The window itself is scheduled on open.
+      this.#schedule(
+        () => this.#close('timeout', null, ''),
+        this.#i.listen_seconds * 1000 + CONNECT_BUDGET_MS,
+      )
+
+      this.#ctx.signal.addEventListener('abort', this.#onAbort, { once: true })
+      // addEventListener does not fire for a signal that is already aborted,
+      // which would leave the socket open until the outer bound expires.
+      if (this.#ctx.signal.aborted) this.#onAbort()
+
+      // `on`, not `once`: an 'error' with no listener crashes the whole process,
+      // and a socket can emit a second one after the first. Shared with
+      // measure.http, because error codes are public contract and the same
+      // socket failure must not surface under two different names.
+      socket.on('error', (e: NodeJS.ErrnoException) => this.#end(Err(mapSocketError(e))))
+      socket.once('connect', () =>
+        socket.write(buildUpgradeRequest(this.#target, this.#key, this.#i)),
+      )
+      socket.on('data', (chunk: Buffer) => this.#onData(chunk))
+      socket.once('close', () => {
+        if (this.#openedAt !== null) this.#close('server', null, '')
+      })
+    })
+  }
+
+  /** The warnings that tell the caller where the observation is incomplete. */
+  reportWarnings(): void {
+    if (this.#protocolFault) {
+      // The window was cut short, and the caller must not read the message
+      // list as "everything that arrived in N seconds".
+      this.#ctx.warn({
+        code: WarningCodes.WS_PROTOCOL_ERROR,
+        message: 'the peer sent a frame this client cannot interpret; the listen ended early',
+      })
+    }
+    if (this.#assembler.pending) {
+      this.#ctx.warn({
+        code: WarningCodes.WS_MESSAGE_INCOMPLETE,
+        message:
+          'the listen ended while a fragmented message was still arriving; it is not reported',
+      })
+    }
+    if (this.#truncated) {
+      this.#ctx.warn({
+        code: WarningCodes.MESSAGES_TRUNCATED,
+        message: 'message accumulation hit a cap; listening continued for the full window',
+        detail: {
+          max_messages: this.#i.max_messages,
+          max_message_bytes: this.#i.max_message_bytes,
+          max_total_bytes: this.#i.max_total_bytes,
+        },
+      })
+    }
+  }
+
+  observation(): MeasureWsData {
+    const opened = this.#openedAt
+    return {
+      kind: 'ws',
+      connected: opened !== null,
+      opened_at: opened === null ? null : toIsoWithOffset(opened),
+      handshake_ms: this.#handshakeMs,
+      negotiated_subprotocol: this.#negotiated,
+      closed: this.#closed,
+      listen_seconds_requested: this.#i.listen_seconds,
+      listen_seconds_actual:
+        opened === null ? 0 : (this.#ctx.clock.monotonic() - this.#openedMonotonic) / 1000,
+      messages: this.#messages,
+      message_count: this.#messages.length,
+      messages_truncated: this.#truncated,
+      bytes_total: this.#inboundBytes,
+    }
+  }
+
+  readonly #onAbort = (): void => {
+    this.#recordClose('client', null, 'cancelled')
+    this.#end(Err(toolError(ErrorCodes.CANCELLED, 'the call was cancelled')))
+  }
+
+  #onData(chunk: Buffer): void {
+    // An empty remainder is the common case once frames are being consumed;
+    // taking the chunk as-is avoids a copy per event.
+    this.#buffer = this.#buffer.length === 0 ? chunk : Buffer.concat([this.#buffer, chunk])
+
+    if (this.#openedAt === null) {
+      const sep = this.#buffer.indexOf('\r\n\r\n')
+      if (sep === -1) return
+      const head = this.#buffer.subarray(0, sep).toString('utf8')
+      this.#buffer = this.#buffer.subarray(sep + 4)
+      if (!this.#open(head)) return
+    }
+
+    const { frames, rest, malformed } = decodeFrames(this.#buffer)
+    this.#buffer = rest
+    if (malformed) {
+      this.#protocolFault = true
+      this.#close('client', 1002, 'protocol error')
+      return
+    }
+    for (const frame of frames) {
+      if (!this.#onFrame(frame)) return
+    }
+  }
+
+  /** Completes the upgrade and starts the window. False if the upgrade failed. */
+  #open(head: string): boolean {
+    const accept = createHash('sha1')
+      .update(this.#key + GUID)
+      .digest('base64')
+    const upgrade = parseUpgradeResponse(head, accept)
+    if (!upgrade.ok) {
+      this.#end(Err(upgrade.error))
+      return false
+    }
+    this.#negotiated = upgrade.value.negotiatedSubprotocol
+    this.#openedAt = this.#ctx.clock.now()
+    this.#openedMonotonic = this.#ctx.clock.monotonic()
+    this.#handshakeMs = this.#openedMonotonic - this.#started
+
+    // The connect bound is over; the window starts now and always runs its full length.
+    this.#clearTimers()
+    this.#schedule(() => this.#close('timeout', null, ''), this.#i.listen_seconds * 1000)
+    for (const msg of this.#i.send) {
+      if (msg.delay_ms === 0) this.#send(msg.payload)
+      else this.#schedule(() => this.#send(msg.payload), msg.delay_ms)
+    }
+    return true
+  }
+
+  /** Handles one frame. False when it ended the listen. */
+  #onFrame(frame: Frame): boolean {
+    if (frame.opcode === OP_CLOSE) {
+      const code = frame.payload.length >= 2 ? frame.payload.readUInt16BE(0) : null
+      this.#close('server', code, frame.payload.subarray(2).toString('utf8'))
+      return false
+    }
+    // Control frames are never fragmented and never become messages.
+    if (frame.opcode === OP_PING) {
+      this.#socket?.write(encodeFrame(OP_PONG, frame.payload))
+      return true
+    }
+    if (frame.opcode === OP_PONG) return true
+
+    const message = this.#assembler.accept(frame)
+    if (message !== null) this.#receive(message.opcode, message.payload)
+    return true
+  }
+
+  /**
+   * Records a received message within the caps. The caps bound what was
+   * RECEIVED — that is the observation; the caller's own `send` messages are
+   * few and deliberate, and counting them would shrink its inbound budget.
+   */
+  #receive(opcode: number, payload: Buffer): void {
+    const i = this.#i
+    if (this.#inboundCount >= i.max_messages || this.#inboundBytes >= i.max_total_bytes) {
+      // Stop accumulating, but keep listening: the caller asked for a window of
+      // time, and cutting it short would misreport the window.
+      this.#truncated = true
+      return
+    }
+    // Byte cap by design; the last multibyte character may be split, which
+    // decodePayload surfaces as replacement text or non-JSON.
+    const capped = payload.subarray(0, i.max_message_bytes)
+    if (capped.length < payload.length) this.#truncated = true
+    this.#inboundCount += 1
+    this.#inboundBytes += capped.length
+    const isText = opcode === OP_TEXT
+    this.#push('in', isText ? 'text' : 'binary', capped)
+  }
+
+  #send(payload: MeasureWsInput['send'][number]['payload']): void {
+    if (this.#settle === null) return // the listen already ended
+    const buf = Buffer.from(typeof payload === 'string' ? payload : JSON.stringify(payload), 'utf8')
+    this.#socket?.write(encodeFrame(OP_TEXT, buf))
+    this.#push('out', 'text', buf)
+  }
+
+  #push(direction: Message['direction'], type: Message['type'], buf: Buffer): void {
+    const decoded = decodePayload(buf, type === 'text')
+    this.#messages.push({
+      seq: ++this.#seq,
+      at: toIsoWithOffset(this.#ctx.clock.now()),
+      offset_ms: this.#ctx.clock.monotonic() - this.#openedMonotonic,
+      direction,
+      type,
+      bytes: buf.length,
+      payload: decoded.payload,
+      payload_format: decoded.format,
+    })
+  }
+
+  /** Ends the listen normally, saying who closed it. */
+  #close(by: 'server' | 'client' | 'timeout', code: number | null, reason: string): void {
+    this.#recordClose(by, code, reason)
+    this.#end(Ok(undefined))
+  }
+
+  /** Only the first close is the real one. */
+  #recordClose(by: 'server' | 'client' | 'timeout', code: number | null, reason: string): void {
+    this.#closed ??= { at: toIsoWithOffset(this.#ctx.clock.now()), code, reason, by }
+  }
+
+  #end(result: Result<void>): void {
+    const settle = this.#settle
+    if (settle === null) return
+    this.#settle = null
+    this.#clearTimers()
+    this.#ctx.signal.removeEventListener('abort', this.#onAbort)
+    this.#socket?.destroy()
+    settle(result)
+  }
+
+  #schedule(fn: () => void, ms: number): void {
+    const t = setTimeout(() => {
+      this.#timers.delete(t)
+      fn()
+    }, ms)
+    this.#timers.add(t)
+  }
+
+  #clearTimers(): void {
+    for (const t of this.#timers) clearTimeout(t)
+    this.#timers.clear()
+  }
 }

@@ -1,7 +1,7 @@
 import { mkdir, realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
-import { CoreErrors, Err, Ok, toolError, type Result } from '../kernel/result.js'
+import { ErrorCodes, Err, Ok, toolError, type Result } from '../kernel/result.js'
 
 /**
  * On-disk layout and path safety.
@@ -34,7 +34,7 @@ export interface ProjectPaths {
 export async function projectPaths(root: string, project: string): Promise<Result<ProjectPaths>> {
   if (project.includes('/') || project.includes('\\') || project.includes('..')) {
     return Err(
-      toolError(CoreErrors.PATH_NOT_ALLOWED, 'project name cannot traverse directories', {
+      toolError(ErrorCodes.PATH_NOT_ALLOWED, 'project name cannot traverse directories', {
         detail: { project },
       }),
     )
@@ -49,7 +49,7 @@ export async function projectPaths(root: string, project: string): Promise<Resul
     await mkdir(logs, { recursive: true })
   } catch (e) {
     return Err(
-      toolError(CoreErrors.STORAGE_ERROR, 'could not create the project directories', { cause: e }),
+      toolError(ErrorCodes.STORAGE_ERROR, 'could not create the project directories', { cause: e }),
     )
   }
 
@@ -63,14 +63,14 @@ export async function projectPaths(root: string, project: string): Promise<Resul
     realLogs = await realpath(logs)
   } catch (e) {
     return Err(
-      toolError(CoreErrors.STORAGE_ERROR, 'could not resolve the data directory', { cause: e }),
+      toolError(ErrorCodes.STORAGE_ERROR, 'could not resolve the data directory', { cause: e }),
     )
   }
 
   if (!realLogs.startsWith(realRoot + sep)) {
     return Err(
       toolError(
-        CoreErrors.PATH_NOT_ALLOWED,
+        ErrorCodes.PATH_NOT_ALLOWED,
         'the project directory resolves outside the data root',
         {
           detail: { project },

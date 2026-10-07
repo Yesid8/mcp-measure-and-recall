@@ -1,6 +1,6 @@
 import { open, readFile, unlink, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
-import { CoreErrors, Err, Ok, toolError, type Result } from '../kernel/result.js'
+import { ErrorCodes, Err, Ok, toolError, type Result } from '../kernel/result.js'
 
 /**
  * Instance lock: one process per data directory.
@@ -19,7 +19,7 @@ import { CoreErrors, Err, Ok, toolError, type Result } from '../kernel/result.js
  */
 
 /** Raised when another live process holds the data directory. */
-export const DATA_DIR_IN_USE = 'DATA_DIR_IN_USE'
+export const DATA_DIR_IN_USE = ErrorCodes.DATA_DIR_IN_USE
 
 /** Proof of holding the lock. Release it on shutdown; a crash leaves it stale. */
 export interface LockHandle {
@@ -53,7 +53,7 @@ export async function acquireInstanceLock(dataDir: string): Promise<Result<LockH
     await mkdir(dataDir, { recursive: true })
   } catch (e) {
     return Err(
-      toolError(CoreErrors.STORAGE_ERROR, 'could not create the data directory', { cause: e }),
+      toolError(ErrorCodes.STORAGE_ERROR, 'could not create the data directory', { cause: e }),
     )
   }
 
@@ -87,7 +87,7 @@ export async function acquireInstanceLock(dataDir: string): Promise<Result<LockH
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
         return Err(
-          toolError(CoreErrors.STORAGE_ERROR, 'could not create the instance lock', { cause: e }),
+          toolError(ErrorCodes.STORAGE_ERROR, 'could not create the instance lock', { cause: e }),
         )
       }
 

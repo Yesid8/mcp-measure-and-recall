@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # Runtime and tooling. Grouped so a week's bumps arrive as one pull request
+  # that CI checks as a whole, instead of one per package.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      dev-dependencies:
+        dependency-type: development
+      runtime:
+        dependency-type: production
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
